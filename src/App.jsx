@@ -503,6 +503,29 @@ function StudentApp(props){
   var [loading,setLoading]=useState(false);
   var fileRef=useRef();
 
+  useEffect(function(){
+    if(!props.user) return;
+    var key = "launchdfw_saved_jobs_" + props.user.uid;
+    var stored = [];
+    try{ stored = JSON.parse(localStorage.getItem(key) || "[]"); }catch{ void 0; }
+    if(!Array.isArray(stored)) stored = [];
+    setSaved(stored);
+
+    dbLoadSaved(props.user.uid).then(function(data){
+      if(Array.isArray(data)){
+        var merged = Array.from(new Set(stored.concat(data)));
+        setSaved(merged);
+        try{ localStorage.setItem(key, JSON.stringify(merged)); }catch{ void 0; }
+      }
+    });
+  },[props.user]);
+
+  useEffect(function(){
+    if(!props.user) return;
+    var key = "launchdfw_saved_jobs_" + props.user.uid;
+    try{ localStorage.setItem(key, JSON.stringify(saved)); }catch{ void 0; }
+  },[saved, props.user]);
+
   // Load real data from Supabase when connected
   useEffect(function(){
     if(!sb||!props.user)return;
@@ -515,7 +538,6 @@ function StudentApp(props){
       });
       setApps(mapped);
     });
-    dbLoadSaved(props.user.uid).then(function(data){setSaved(Array.isArray(data)?data:[]);});
     // Load profile data from profiles table
     sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
       // Load student data from students table
@@ -542,24 +564,33 @@ function StudentApp(props){
   function hasApp(id){return apps.some(function(a){return a.jobId===id;});}
 
   async function togSave(id){
+    var key = props.user ? "launchdfw_saved_jobs_" + props.user.uid : "launchdfw_saved_jobs";
+
+    function storeSaved(next){
+      try{ localStorage.setItem(key, JSON.stringify(next)); }catch{ void 0; }
+      return next;
+    }
+
     if(saved.includes(id)){
-      setSaved(function(p){return p.filter(function(x){return x!==id;});});
+      var next = saved.filter(function(x){return x!==id;});
+      setSaved(storeSaved(next));
       if(sb&&props.user){
         var res = await dbUnsaveJob(props.user.uid,id);
         if(res.error){
-          setSaved(function(p){return p.concat([id]);});
-          props.show("Could not remove saved job: "+res.error,"err");
+          props.show("Removed locally, but server unsave failed","info");
+          console.warn("dbUnsaveJob error", res.error);
           return;
         }
       }
       props.show("Removed from saved");
     } else {
-      setSaved(function(p){return p.concat([id]);});
+      var added = saved.includes(id) ? saved : saved.concat([id]);
+      setSaved(storeSaved(added));
       if(sb&&props.user){
         let res = await dbSaveJob(props.user.uid,id);
         if(res.error){
-          setSaved(function(p){return p.filter(function(x){return x!==id;});});
-          props.show("Could not save job: "+res.error,"err");
+          props.show("Saved locally, but server sync failed","info");
+          console.warn("dbSaveJob error", res.error);
           return;
         }
       }
