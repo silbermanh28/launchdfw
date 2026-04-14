@@ -60,13 +60,15 @@ async function dbSubmitApp(jobId, studentId, availability, note, answers) {
 }
 
 async function dbSaveJob(studentId, jobId) {
-  if (!sb) return;
-  await sb.from("saved_jobs").insert({ student_id: studentId, job_id: jobId });
+  if (!sb) return { error: "not_connected" };
+  var res = await sb.from("saved_jobs").insert({ student_id: studentId, job_id: jobId });
+  return res.error ? { error: res.error.message } : { ok: true };
 }
 
 async function dbUnsaveJob(studentId, jobId) {
-  if (!sb) return;
-  await sb.from("saved_jobs").delete().eq("student_id", studentId).eq("job_id", jobId);
+  if (!sb) return { error: "not_connected" };
+  var res = await sb.from("saved_jobs").delete().eq("student_id", studentId).eq("job_id", jobId);
+  return res.error ? { error: res.error.message } : { ok: true };
 }
 
 async function dbLoadSaved(studentId) {
@@ -477,7 +479,7 @@ function StudentApp(props){
   var [selJob,setSelJob]=useState(null);
   var [jobs,setJobs]=useState(LOCAL_JOBS);
   var [apps,setApps]=useState(LOCAL_APPS);
-  var [saved,setSaved]=useState([2,7]);
+  var [saved,setSaved]=useState([]);
   var [resume,setResume]=useState(null);
   var [rd,setRd]=useState({firstName:"Alex",lastName:"Johnson",email:"alex.j@email.com",phone:"(214) 555-0192",school:"Skyline High School",grade:"11th Grade",gpa:"3.8",summary:"Motivated student seeking part-time work to build professional skills.",skills:["Customer Service","Microsoft Office","Canva"],activities:["Debate Club Captain","National Honor Society"],experience:[{role:"Volunteer",org:"Dallas Food Bank",dates:"Sep 2024-Present",desc:"Sorted donations for 200+ families per shift."}]});
   var [tmpl,setTmpl]=useState("classic");
@@ -513,7 +515,7 @@ function StudentApp(props){
       });
       setApps(mapped);
     });
-    dbLoadSaved(props.user.uid).then(function(data){if(data)setSaved(data);});
+    dbLoadSaved(props.user.uid).then(function(data){setSaved(Array.isArray(data)?data:[]);});
     // Load profile data from profiles table
     sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
       // Load student data from students table
@@ -539,14 +541,28 @@ function StudentApp(props){
 
   function hasApp(id){return apps.some(function(a){return a.jobId===id;});}
 
-  function togSave(id){
+  async function togSave(id){
     if(saved.includes(id)){
       setSaved(function(p){return p.filter(function(x){return x!==id;});});
-      if(sb&&props.user)dbUnsaveJob(props.user.uid,id);
+      if(sb&&props.user){
+        var res = await dbUnsaveJob(props.user.uid,id);
+        if(res.error){
+          setSaved(function(p){return p.concat([id]);});
+          props.show("Could not remove saved job: "+res.error,"err");
+          return;
+        }
+      }
       props.show("Removed from saved");
     } else {
       setSaved(function(p){return p.concat([id]);});
-      if(sb&&props.user)dbSaveJob(props.user.uid,id);
+      if(sb&&props.user){
+        let res = await dbSaveJob(props.user.uid,id);
+        if(res.error){
+          setSaved(function(p){return p.filter(function(x){return x!==id;});});
+          props.show("Could not save job: "+res.error,"err");
+          return;
+        }
+      }
       props.show("Saved!");
     }
   }
