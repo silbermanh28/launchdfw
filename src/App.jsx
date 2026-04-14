@@ -33,8 +33,9 @@ async function dbSignIn(email, password) {
   var res = await sb.auth.signInWithPassword({ email: email, password: password });
   if (res.error) return { error: res.error.message };
   var uid = res.data.user.id;
-  var prof = await sb.from("profiles").select("role,first_name,last_name").eq("id", uid).single();
+  var prof = await sb.from("profiles").select("role,first_name,last_name").eq("id", uid).maybeSingle();
   if (prof.error) return { error: prof.error.message };
+  if (!prof.data) return { error: "Profile not found. Please contact support." };
   return { uid: uid, role: prof.data.role, name: prof.data.first_name + " " + prof.data.last_name };
 }
 
@@ -87,17 +88,25 @@ async function dbUpdateProfile(studentId, fields) {
 
 async function dbLoadProfile(studentId) {
   if (!sb) return null;
-  var res = await sb.from("students").select("*").eq("id", studentId).single();
-  return res.error ? null : res.data;
+  var res = await sb.from("students").select("*").eq("id", studentId).maybeSingle();
+  return res.error || !res.data ? null : res.data;
 }
 
-async function dbUploadResume(studentId, file) {
-  if (!sb) return { error: "not_connected" };
-  var path = "resumes/" + studentId + "/" + file.name;
-  var up = await sb.storage.from("resumes").upload(path, file, { upsert: true });
-  if (up.error) return { error: up.error.message };
-  await sb.from("resumes").upsert({ student_id: studentId, file_path: path, file_name: file.name });
-  return { ok: true, name: file.name };
+async function dbSaveResumeData(studentId, resumeData) {
+  if (!sb) return;
+  await sb.from("students").update({
+    first_name: resumeData.firstName,
+    last_name: resumeData.lastName,
+    email: resumeData.email,
+    phone: resumeData.phone,
+    school: resumeData.school,
+    grade: resumeData.grade,
+    gpa: resumeData.gpa,
+    summary: resumeData.summary,
+    skills: resumeData.skills,
+    activities: resumeData.activities,
+    experience: resumeData.experience
+  }).eq("id", studentId);
 }
 
 // Employer functions
@@ -329,8 +338,8 @@ export default function App(){
     sb.auth.getSession().then(function(res){
       if(res.data&&res.data.session){
         var uid=res.data.session.user.id;
-        sb.from("profiles").select("role,first_name,last_name").eq("id",uid).single().then(function(p){
-          if(!p.error) handleLogin({uid,role:p.data.role,name:p.data.first_name+" "+p.data.last_name});
+        sb.from("profiles").select("role,first_name,last_name").eq("id",uid).maybeSingle().then(function(p){
+          if(!p.error && p.data) handleLogin({uid,role:p.data.role,name:p.data.first_name+" "+p.data.last_name});
         });
       }
     });
@@ -363,6 +372,7 @@ function LoginScreen(props){
 
   async function handleStudentAuth(){
     if(!email||!pw){props.show("Enter email and password","err");return;}
+    if(isNew&&!name){props.show("Enter your full name","err");return;}
     setLoading(true);
     if(!sb){
       // Demo mode - no real auth
@@ -382,6 +392,7 @@ function LoginScreen(props){
 
   async function handleBizAuth(){
     if(!email||!pw){props.show("Enter email and password","err");return;}
+    if(isNew&&(!name||!company)){props.show("Enter your name and company","err");return;}
     setLoading(true);
     if(!sb){
       props.onLogin({uid:"demo-biz",role:"business",name:company||"Houndstooth Coffee"});
@@ -435,10 +446,10 @@ function LoginScreen(props){
               <div onClick={function(){setIsNew(true);}} style={{flex:1,textAlign:"center",padding:"7px 0",borderRadius:8,background:isNew?SF:"transparent",color:isNew?"#fff":MU,fontSize:13,fontWeight:700,cursor:"pointer"}}>Create Account</div>
             </div>
             <div style={{display:"flex",flexDirection:"column",gap:11}}>
-              {isNew&&mode==="student"&&<div><Lbl t="FULL NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Alex Johnson"/></div>}
+              {isNew&&mode==="student"&&<div><Lbl t="FULL NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Your Full Name"/></div>}
               {isNew&&mode==="student"&&<div><Lbl t="SCHOOL"/><Inp v={school} onChange={function(e){setSchool(e.target.value);}} ph="Skyline High School"/></div>}
               {isNew&&mode==="business"&&<div><Lbl t="COMPANY NAME"/><Inp v={company} onChange={function(e){setCompany(e.target.value);}} ph="Houndstooth Coffee"/></div>}
-              {isNew&&mode==="business"&&<div><Lbl t="YOUR NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Jane Smith"/></div>}
+              {isNew&&mode==="business"&&<div><Lbl t="YOUR NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Your Name"/></div>}
               <div><Lbl t="EMAIL"/><Inp v={email} onChange={function(e){setEmail(e.target.value);}} ph="you@email.com" tp="email"/></div>
               <div><Lbl t="PASSWORD"/><Inp v={pw} onChange={function(e){setPw(e.target.value);}} ph="password" tp="password"/></div>
             </div>
@@ -496,6 +507,23 @@ function StudentApp(props){
       setApps(mapped);
     });
     dbLoadSaved(props.user.uid).then(function(data){if(data)setSaved(data);});
+    dbLoadProfile(props.user.uid).then(function(data){
+      if(data){
+        setRd(Object.assign({}, rd, {
+          firstName: data.first_name || "",
+          lastName: data.last_name || "",
+          email: data.email || "",
+          phone: data.phone || "",
+          school: data.school || "",
+          grade: data.grade || "",
+          gpa: data.gpa || "",
+          summary: data.summary || "",
+          skills: data.skills || [],
+          activities: data.activities || [],
+          experience: data.experience || []
+        }));
+      }
+    });
   },[props.user]);
 
   function hasApp(id){return apps.some(function(a){return a.jobId===id;});}
@@ -908,7 +936,15 @@ function StudentResumePage(props){
             </div>;})}
             <Btn ch="+ Add Experience" v="gh" sm onClick={function(){props.setRd(function(p){return Object.assign({},p,{experience:p.experience.concat([{role:"",org:"",dates:"",desc:""}])});});}}/>
           </div>
-          <Btn ch="Save and Use This Resume" lg sx={{width:"100%",justifyContent:"center"}} onClick={function(){props.setResume({name:props.rd.firstName+"_"+props.rd.lastName+"_Resume.pdf",size:"42KB"});props.show("Resume saved! You can now apply.");props.setTab("upload");}}/>
+          <Btn ch="Save and Use This Resume" lg sx={{width:"100%",justifyContent:"center"}} onClick={async function(){
+            if(sb&&props.user){
+              await dbSaveResumeData(props.user.uid, props.rd);
+              props.show("Resume data saved!");
+            }
+            props.setResume({name:props.rd.firstName+"_"+props.rd.lastName+"_Resume.pdf",size:"42KB"});
+            props.show("Resume saved! You can now apply.");
+            props.setTab("upload");
+          }}/>
         </div>
         <div style={{position:"sticky",top:0}}><p style={{color:"#fff",fontWeight:700,fontSize:14,marginBottom:12}}>Live Preview</p><ResumeCard data={props.rd} tid={props.tmpl}/></div>
       </div>}
