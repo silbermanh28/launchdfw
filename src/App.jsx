@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { FaUser, FaEnvelope, FaCheck, FaHeart, FaStar, FaFootballBall, FaPlane, FaMugHot, FaClipboard, FaHourglassHalf, FaTimes, FaCoffee, FaLaptop, FaFutbol, FaCamera, FaBook, FaBuilding, FaShoppingCart, FaPaw, FaSoap, FaUniversity, FaChartLine, FaPen, FaBasketballBall, FaDrumstickBite, FaHospital, FaShoppingBag, FaCar, FaFilm, FaLeaf, FaGraduationCap, FaExclamationTriangle, FaLock, FaDoorOpen, FaArrowLeft, FaHome, FaFileAlt, FaCalendar, FaUsers, FaBriefcase, FaMapMarker, FaQuestion, FaSearch, FaClock, FaStickyNote, FaLightbulb, FaMicrophone, FaTrophy, FaUpload, FaWrench, FaPalette, FaRegHeart } from "react-icons/fa";
 import { supabase } from "./supabaseClient";
 
@@ -37,11 +37,6 @@ async function dbSignIn(email, password) {
   if (prof.error) return { error: prof.error.message };
   if (!prof.data) return { error: "Profile not found. Please contact support." };
   return { uid: uid, role: prof.data.role, name: prof.data.first_name + " " + prof.data.last_name };
-}
-
-async function dbSignOut() {
-  if (!sb) return;
-  await sb.auth.signOut();
 }
 
 async function dbLoadJobs() {
@@ -86,12 +81,6 @@ async function dbUpdateProfile(studentId, fields) {
   await sb.from("students").update(fields).eq("id", studentId);
 }
 
-async function dbLoadProfile(studentId) {
-  if (!sb) return null;
-  var res = await sb.from("students").select("*").eq("id", studentId).maybeSingle();
-  return res.error || !res.data ? null : res.data;
-}
-
 async function dbSaveResumeData(studentId, resumeData) {
   if (!sb) return;
   await sb.from("students").update({
@@ -107,6 +96,24 @@ async function dbSaveResumeData(studentId, resumeData) {
     activities: resumeData.activities,
     experience: resumeData.experience
   }).eq("id", studentId);
+}
+
+async function dbSaveProfile(studentId, profileData) {
+  if (!sb) return { error: "not_connected" };
+  const { error } = await sb.from("profiles").update({
+    first_name: profileData.firstName,
+    last_name: profileData.lastName
+  }).eq("id", studentId);
+  if (error) return { error: error.message };
+  return {};
+}
+
+async function dbUploadResume(uid, file) {
+  if (!sb) return { error: "not_connected" };
+  const fileName = `${uid}/${file.name}`;
+  const { data, error } = await sb.storage.from('resumes').upload(fileName, file);
+  if (error) return { error: error.message };
+  return { path: data.path };
 }
 
 // Employer functions
@@ -507,22 +514,26 @@ function StudentApp(props){
       setApps(mapped);
     });
     dbLoadSaved(props.user.uid).then(function(data){if(data)setSaved(data);});
-    dbLoadProfile(props.user.uid).then(function(data){
-      if(data){
-        setRd(Object.assign({}, rd, {
-          firstName: data.first_name || "",
-          lastName: data.last_name || "",
-          email: data.email || "",
-          phone: data.phone || "",
-          school: data.school || "",
-          grade: data.grade || "",
-          gpa: data.gpa || "",
-          summary: data.summary || "",
-          skills: data.skills || [],
-          activities: data.activities || [],
-          experience: data.experience || []
-        }));
-      }
+    // Load profile data from profiles table
+    sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
+      // Load student data from students table
+      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience").eq("id", props.user.uid).maybeSingle().then(function(sdata){
+        if(pdata.data || sdata.data){
+          setRd(function(r){return Object.assign({}, r, {
+            firstName: pdata.data?.first_name || "",
+            lastName: pdata.data?.last_name || "",
+            email: sdata.data?.email || "",
+            phone: sdata.data?.phone || "",
+            school: sdata.data?.school || "",
+            grade: sdata.data?.grade || "",
+            gpa: sdata.data?.gpa || "",
+            summary: sdata.data?.summary || "",
+            skills: sdata.data?.skills || [],
+            activities: sdata.data?.activities || [],
+            experience: sdata.data?.experience || []
+          });});
+        }
+      });
     });
   },[props.user]);
 
@@ -938,6 +949,7 @@ function StudentResumePage(props){
           </div>
           <Btn ch="Save and Use This Resume" lg sx={{width:"100%",justifyContent:"center"}} onClick={async function(){
             if(sb&&props.user){
+              await dbSaveProfile(props.user.uid, props.rd);
               await dbSaveResumeData(props.user.uid, props.rd);
               props.show("Resume data saved!");
             }
