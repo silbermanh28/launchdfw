@@ -586,7 +586,7 @@ function StudentApp(props){
             // Extract name from URL
             const urlParts = sdata.data.resume_url.split('/');
             const fileName = urlParts[urlParts.length - 1];
-            setResume({name: fileName, url: sdata.data.resume_url});
+            setResume({name: fileName, size: "Uploaded", url: sdata.data.resume_url});
           }
         }
       });
@@ -973,7 +973,8 @@ function StudentResumePage(props){
       var res=await dbUploadResume(props.user.uid,f);
       if(res.error){props.show("Upload failed: "+res.error,"err");return;}
       // Save the resume URL to database
-      await sb.from("students").update({ resume_url: res.url }).eq("id", props.user.uid);
+      const updateRes = await sb.from("students").update({ resume_url: res.url }).eq("id", props.user.uid);
+      if(updateRes.error){props.show("Failed to save resume URL: "+updateRes.error.message,"err");return;}
     }
     props.setResume({name:f.name,size:(f.size/1024).toFixed(0)+"KB", url: res?.url});
     props.show("Resume uploaded! Success");
@@ -989,7 +990,7 @@ function StudentResumePage(props){
           {props.resume?<div><p style={{fontSize:32,marginBottom:8}}><FaCheck /></p><p style={{color:PR,fontSize:14,fontWeight:800}}>{props.resume.name}</p><p style={{color:MU,fontSize:12}}>{props.resume.size} - Click to replace</p></div>:<div><p style={{fontSize:32,marginBottom:8}}><FaUpload /></p><p style={{color:"#fff",fontSize:14,fontWeight:800,marginBottom:3}}>Upload Your Resume</p><p style={{color:MU,fontSize:12}}>PDF or Word (.docx)</p></div>}
         </div>
         {!props.resume&&<div style={bx({textAlign:"center"})}><p style={{color:MU,fontSize:13,marginBottom:11}}>Do not have one yet?</p><div style={{display:"flex",gap:9,justifyContent:"center"}}><Btn ch="Build One" onClick={function(){props.setTab("builder");}}/><Btn ch="See Example" v="gh" onClick={function(){props.setTab("example");}}/></div></div>}
-        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><div style={{display:"flex",gap:8}}><Btn ch="View Resume" v="gh" sm onClick={function(){window.open(props.resume.url,'_blank');}}/><Btn ch="Remove" v="gh" sm onClick={async function(){props.setResume(null);if(sb&&props.user)await sb.from("students").update({resume_url:null}).eq("id",props.user.uid);props.show("Removed","info");}}/></div></div>}
+        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><div style={{display:"flex",gap:8}}><Btn ch="View Resume" v="gh" sm onClick={function(){window.open(props.resume.url,'_blank');}}/><Btn ch="Remove" v="gh" sm onClick={async function(){props.setResume(null);if(sb&&props.user){const res=await sb.from("students").update({resume_url:null}).eq("id",props.user.uid);if(res.error)props.show("Failed to remove: "+res.error.message,"err");else props.show("Removed","info");}else props.show("Removed","info");}}/></div></div>}
       </div>}
       {props.tab==="templates"&&<div style={{maxWidth:600}}>
         <p style={{color:MU,fontSize:13,marginBottom:14}}>Pick a style, then customize in Builder.</p>
