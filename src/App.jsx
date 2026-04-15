@@ -55,7 +55,7 @@ async function dbLoadMyApps(studentId) {
 
 async function dbSubmitApp(jobId, studentId, availability, note, answers) {
   if (!sb) return { error: "not_connected" };
-  var res = await sb.from("applications").insert({ job_id: jobId, student_id: studentId, availability: availability, note: note, answers: answers, status: "pending" });
+  var res = await sb.from("applications").insert({ job_id: jobId, student_id: studentId, availability: JSON.stringify(availability), note: note, answers: JSON.stringify(answers), status: "pending" });
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
@@ -1090,7 +1090,27 @@ function BizApp(props){
   useEffect(function(){
     if(!sb||!props.user)return;
     dbLoadMyJobs(props.user.uid).then(function(data){if(data&&data.length)setMyJobs(data);});
-    dbLoadApplicants(props.user.uid).then(function(data){if(data)setApplicants(data);});
+    dbLoadApplicants(props.user.uid).then(function(data){
+      if(data){
+        var mapped = data.map(function(a){
+          return {
+            id: a.id,
+            jobId: a.job_id,
+            name: a.students.first_name + ' ' + a.students.last_name,
+            school: a.students.school,
+            grade: a.students.grade,
+            age: a.students.age,
+            email: a.students.email,
+            applied: new Date(a.applied_at).toLocaleDateString(),
+            status: a.status,
+            note: a.note,
+            ans: JSON.parse(a.answers || '{}'),
+            iv: a.interviews && a.interviews[0] ? {date: a.interviews[0].interview_date, time: a.interviews[0].interview_time, loc: a.interviews[0].location, notes: a.interviews[0].notes} : null
+          };
+        });
+        setApplicants(mapped);
+      }
+    });
   },[props.user]);
 
   async function updStatus(id,st){
