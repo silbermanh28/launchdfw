@@ -61,20 +61,43 @@ async function dbSubmitApp(jobId, studentId, availability, note, answers) {
 
 async function dbSaveJob(studentId, jobId) {
   if (!sb) return { error: "not_connected" };
+  if (!studentId || !jobId) {
+    return { error: "Invalid save payload: missing studentId or jobId" };
+  }
   var res = await sb.from("saved_jobs").insert({ student_id: studentId, job_id: jobId });
-  return res.error ? { error: res.error.message } : { ok: true };
+  if (res.error) {
+    console.error("dbSaveJob error", res.error, res);
+    if (res.error.message && res.error.message.toLowerCase().includes("duplicate")) {
+      return { ok: true };
+    }
+    var errMsg = res.error.message || res.error.details || res.error.hint || JSON.stringify(res.error);
+    return { error: errMsg };
+  }
+  return { ok: true };
 }
 
 async function dbUnsaveJob(studentId, jobId) {
   if (!sb) return { error: "not_connected" };
+  if (!studentId || !jobId) {
+    return { error: "Invalid unsave payload: missing studentId or jobId" };
+  }
   var res = await sb.from("saved_jobs").delete().eq("student_id", studentId).eq("job_id", jobId);
-  return res.error ? { error: res.error.message } : { ok: true };
+  if (res.error) {
+    console.error("dbUnsaveJob error", res.error, res);
+    var errMsg = res.error.message || res.error.details || res.error.hint || JSON.stringify(res.error);
+    return { error: errMsg };
+  }
+  return { ok: true };
 }
 
 async function dbLoadSaved(studentId) {
   if (!sb) return null;
+  if (!studentId) return [];
   var res = await sb.from("saved_jobs").select("job_id").eq("student_id", studentId);
-  if (res.error) return null;
+  if (res.error) {
+    console.error("dbLoadSaved error", res.error, res);
+    return null;
+  }
   return res.data.map(function(r) { return r.job_id; });
 }
 
@@ -589,8 +612,8 @@ function StudentApp(props){
       if(sb&&props.user){
         let res = await dbSaveJob(props.user.uid,id);
         if(res.error){
-          props.show("Saved locally, but server sync failed","info");
-          console.warn("dbSaveJob error", res.error);
+          props.show("Saved locally, but server sync failed: "+res.error,"err");
+          console.error("dbSaveJob error", res.error);
           return;
         }
       }
