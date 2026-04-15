@@ -418,6 +418,10 @@ function LoginScreen(props){
       res=await dbSignUp(email,pw,"student",{firstName:name.split(" ")[0],lastName:name.split(" ")[1]||"",school});
     } else {
       res=await dbSignIn(email,pw);
+      if(res.role && res.role !== "student"){
+        props.show("This email is registered as an employer account. Please sign in as employer.","err");
+        setLoading(false);return;
+      }
     }
     setLoading(false);
     if(res.error){props.show(res.error==="not_connected"?"Add your Supabase keys to connect":res.error,"err");return;}
@@ -437,6 +441,10 @@ function LoginScreen(props){
       res=await dbSignUp(email,pw,"employer",{firstName:name.split(" ")[0],lastName:name.split(" ")[1]||"",company});
     } else {
       res=await dbSignIn(email,pw);
+      if(res.role && res.role !== "employer"){
+        props.show("This email is registered as a student account. Please sign in as student.","err");
+        setLoading(false);return;
+      }
     }
     setLoading(false);
     if(res.error){props.show(res.error==="not_connected"?"Add your Supabase keys to connect":res.error,"err");return;}
