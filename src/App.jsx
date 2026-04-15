@@ -666,14 +666,20 @@ function StudentApp(props){
   }
 
   async function submitApp(){
-    setLoading(true);
-    if(sb&&props.user){
-      var res=await dbSubmitApp(applyJob.id,props.user.uid,avail,anote,aAns);
-      if(res.error){props.show("Could not submit: "+res.error,"err");setLoading(false);return;}
+    try {
+      setLoading(true);
+      if(sb&&props.user){
+        var res=await dbSubmitApp(applyJob.id,props.user.uid,avail,anote,aAns);
+        if(res.error){props.show("Could not submit: "+res.error,"err");setLoading(false);return;}
+      }
+      setApps(function(p){return p.concat([{id:"local-"+Date.now(),jobId:applyJob.id,status:"pending",applied:"Today",note:"",iv:null}]);});
+      setApplyJob(null);setSelJob(null);setLoading(false);
+      props.show("Application submitted! Success");
+    } catch (e) {
+      console.error("Submit app error:", e);
+      props.show("Unexpected error: " + e.message,"err");
+      setLoading(false);
     }
-    setApps(function(p){return p.concat([{id:"local-"+Date.now(),jobId:applyJob.id,status:"pending",applied:"Today",note:"",iv:null}]);});
-    setApplyJob(null);setSelJob(null);setLoading(false);
-    props.show("Application submitted! Success");
   }
 
   async function saveProfile(){
