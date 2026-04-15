@@ -119,7 +119,8 @@ async function dbSaveResumeData(studentId, resumeData) {
     summary: resumeData.summary,
     skills: resumeData.skills,
     activities: resumeData.activities,
-    experience: resumeData.experience
+    experience: resumeData.experience,
+    resume_url: resumeData.resumeUrl
   }).eq("id", studentId);
 }
 
@@ -136,9 +137,10 @@ async function dbSaveProfile(studentId, profileData) {
 async function dbUploadResume(uid, file) {
   if (!sb) return { error: "not_connected" };
   const fileName = `${uid}/${file.name}`;
-  const { data, error } = await sb.storage.from('resumes').upload(fileName, file);
+  const { error } = await sb.storage.from('resumes').upload(fileName, file);
   if (error) return { error: error.message };
-  return { path: data.path };
+  const { data: urlData } = sb.storage.from('resumes').getPublicUrl(fileName);
+  return { url: urlData.publicUrl };
 }
 
 // Employer functions
@@ -564,7 +566,7 @@ function StudentApp(props){
     // Load profile data from profiles table
     sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
       // Load student data from students table
-      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience").eq("id", props.user.uid).maybeSingle().then(function(sdata){
+      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience,resume_url").eq("id", props.user.uid).maybeSingle().then(function(sdata){
         if(pdata.data || sdata.data){
           setRd(function(r){return Object.assign({}, r, {
             firstName: pdata.data?.first_name || "",
@@ -577,8 +579,15 @@ function StudentApp(props){
             summary: sdata.data?.summary || "",
             skills: sdata.data?.skills || [],
             activities: sdata.data?.activities || [],
-            experience: sdata.data?.experience || []
+            experience: sdata.data?.experience || [],
+            resumeUrl: sdata.data?.resume_url || ""
           });});
+          if(sdata.data?.resume_url){
+            // Extract name from URL
+            const urlParts = sdata.data.resume_url.split('/');
+            const fileName = urlParts[urlParts.length - 1];
+            setResume({name: fileName, url: sdata.data.resume_url});
+          }
         }
       });
     });
@@ -963,8 +972,10 @@ function StudentResumePage(props){
     if(sb&&props.user){
       var res=await dbUploadResume(props.user.uid,f);
       if(res.error){props.show("Upload failed: "+res.error,"err");return;}
+      // Save the resume URL to database
+      await sb.from("students").update({ resume_url: res.url }).eq("id", props.user.uid);
     }
-    props.setResume({name:f.name,size:(f.size/1024).toFixed(0)+"KB"});
+    props.setResume({name:f.name,size:(f.size/1024).toFixed(0)+"KB", url: res?.url});
     props.show("Resume uploaded! Success");
   }
   return(
@@ -978,7 +989,7 @@ function StudentResumePage(props){
           {props.resume?<div><p style={{fontSize:32,marginBottom:8}}><FaCheck /></p><p style={{color:PR,fontSize:14,fontWeight:800}}>{props.resume.name}</p><p style={{color:MU,fontSize:12}}>{props.resume.size} - Click to replace</p></div>:<div><p style={{fontSize:32,marginBottom:8}}><FaUpload /></p><p style={{color:"#fff",fontSize:14,fontWeight:800,marginBottom:3}}>Upload Your Resume</p><p style={{color:MU,fontSize:12}}>PDF or Word (.docx)</p></div>}
         </div>
         {!props.resume&&<div style={bx({textAlign:"center"})}><p style={{color:MU,fontSize:13,marginBottom:11}}>Do not have one yet?</p><div style={{display:"flex",gap:9,justifyContent:"center"}}><Btn ch="Build One" onClick={function(){props.setTab("builder");}}/><Btn ch="See Example" v="gh" onClick={function(){props.setTab("example");}}/></div></div>}
-        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><Btn ch="Remove" v="gh" sm onClick={function(){props.setResume(null);props.show("Removed","info");}}/></div>}
+        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><div style={{display:"flex",gap:8}}><Btn ch="View Resume" v="gh" sm onClick={function(){window.open(props.resume.url,'_blank');}}/><Btn ch="Remove" v="gh" sm onClick={async function(){props.setResume(null);if(sb&&props.user)await sb.from("students").update({resume_url:null}).eq("id",props.user.uid);props.show("Removed","info");}}/></div></div>}
       </div>}
       {props.tab==="templates"&&<div style={{maxWidth:600}}>
         <p style={{color:MU,fontSize:13,marginBottom:14}}>Pick a style, then customize in Builder.</p>
