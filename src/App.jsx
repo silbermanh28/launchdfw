@@ -566,7 +566,7 @@ function StudentApp(props){
     // Load profile data from profiles table
     sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
       // Load student data from students table
-      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience,resume_url").eq("id", props.user.uid).maybeSingle().then(function(sdata){
+      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience,resume_url,age,bio").eq("id", props.user.uid).maybeSingle().then(function(sdata){
         if(pdata.data || sdata.data){
           setRd(function(r){return Object.assign({}, r, {
             firstName: pdata.data?.first_name || "",
@@ -581,6 +581,17 @@ function StudentApp(props){
             activities: sdata.data?.activities || [],
             experience: sdata.data?.experience || [],
             resumeUrl: sdata.data?.resume_url || ""
+          });});
+          setProf(function(p){return Object.assign({}, p, {
+            firstName: pdata.data?.first_name || p.firstName,
+            lastName: pdata.data?.last_name || p.lastName,
+            email: sdata.data?.email || p.email,
+            phone: sdata.data?.phone || p.phone,
+            school: sdata.data?.school || p.school,
+            grade: sdata.data?.grade || p.grade,
+            age: sdata.data?.age || p.age,
+            bio: sdata.data?.bio || p.bio,
+            skills: sdata.data?.skills || p.skills
           });});
           if(sdata.data?.resume_url){
             // Extract name from URL
@@ -659,7 +670,10 @@ function StudentApp(props){
 
   async function saveProfile(){
     setProf(Object.assign({},pd));setEditP(false);
-    if(sb&&props.user)await dbUpdateProfile(props.user.uid,{school:pd.school,grade:pd.grade,skills:pd.skills});
+    if(sb&&props.user){
+      await dbSaveProfile(props.user.uid, {firstName: pd.firstName, lastName: pd.lastName});
+      await dbUpdateProfile(props.user.uid,{school:pd.school,grade:pd.grade,skills:pd.skills,age:pd.age,bio:pd.bio,email:pd.email,phone:pd.phone});
+    }
     props.show("Profile updated! Success");
   }
 
