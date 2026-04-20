@@ -55,7 +55,14 @@ async function dbLoadMyApps(studentId) {
 
 async function dbSubmitApp(jobId, studentId, availability, note, answers) {
   if (!sb) return { error: "not_connected" };
-  var res = await sb.from("applications").insert({ job_id: jobId, student_id: studentId, availability: JSON.stringify(availability), note: note, answers: JSON.stringify(answers), status: "pending" });
+  var res = await sb.from("applications").insert({
+    job_id: jobId,
+    student_id: studentId,
+    availability: Array.isArray(availability) ? availability : [],
+    note: note,
+    answers: answers || {},
+    status: "pending"
+  });
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
@@ -158,10 +165,72 @@ async function dbPostJob(employerId, job) {
 
 async function dbLoadApplicants(employerId) {
   if (!sb) return null;
-  var res = await sb.from("applications").select("*, students(*), jobs(title)").in("job_id",
-    (await sb.from("jobs").select("id").eq("employer_id", employerId)).data.map(function(j){return j.id;})
-  );
-  return res.error ? null : res.data;
+  var jobsRes = await sb.from("jobs").select("id").eq("employer_id", employerId);
+  if (jobsRes.error) {
+    console.error("dbLoadApplicants jobs error", jobsRes.error);
+    return null;
+  }
+
+  var jobIds = (jobsRes.data || []).map(function(j){ return j.id; });
+  if (jobIds.length === 0) return [];
+
+  var appsRes = await sb
+    .from("applications")
+    .select("*")
+    .in("job_id", jobIds)
+    .order("applied_at", { ascending: false });
+
+  if (appsRes.error) {
+    console.error("dbLoadApplicants applications error", appsRes.error);
+    return null;
+  }
+
+  var apps = appsRes.data || [];
+  var appIds = apps.map(function(a){ return a.id; }).filter(Boolean);
+  var studentIds = Array.from(new Set(apps.map(function(a){ return a.student_id; }).filter(Boolean)));
+  var profilesById = {};
+  var studentsById = {};
+  var interviewsByAppId = {};
+
+  if (studentIds.length > 0) {
+    var studentsRes = await sb.from("students").select("*").in("id", studentIds);
+    if (!studentsRes.error && Array.isArray(studentsRes.data)) {
+      studentsRes.data.forEach(function(student){
+        studentsById[student.id] = student;
+      });
+    } else if (studentsRes.error) {
+      console.warn("dbLoadApplicants students error", studentsRes.error);
+    }
+
+    var profilesRes = await sb.from("profiles").select("id, first_name, last_name").in("id", studentIds);
+    if (!profilesRes.error && Array.isArray(profilesRes.data)) {
+      profilesRes.data.forEach(function(profile){
+        profilesById[profile.id] = profile;
+      });
+    } else if (profilesRes.error) {
+      console.warn("dbLoadApplicants profiles error", profilesRes.error);
+    }
+  }
+
+  if (appIds.length > 0) {
+    var interviewsRes = await sb.from("interviews").select("*").in("application_id", appIds);
+    if (!interviewsRes.error && Array.isArray(interviewsRes.data)) {
+      interviewsRes.data.forEach(function(interview){
+        if (!interviewsByAppId[interview.application_id]) interviewsByAppId[interview.application_id] = [];
+        interviewsByAppId[interview.application_id].push(interview);
+      });
+    } else if (interviewsRes.error) {
+      console.warn("dbLoadApplicants interviews error", interviewsRes.error);
+    }
+  }
+
+  return apps.map(function(app){
+    return Object.assign({}, app, {
+      profile: profilesById[app.student_id] || null,
+      student: studentsById[app.student_id] || null,
+      interviews: interviewsByAppId[app.id] || []
+    });
+  });
 }
 
 async function dbUpdateAppStatus(appId, status) {
@@ -183,6 +252,48 @@ function calcMiles(la1, lo1, la2, lo2) {
   var R = 3959, x = (la2-la1)*Math.PI/180, y = (lo2-lo1)*Math.PI/180;
   var a = Math.sin(x/2)*Math.sin(x/2)+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(y/2)*Math.sin(y/2);
   return parseFloat((R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a))).toFixed(1));
+}
+
+function parseJobQuestions(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      var parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      if (value.trim()) return [value.trim()];
+    }
+  }
+  return [];
+}
+
+function parseJsonObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      var parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function normalizeJob(job) {
+  if (!job) return job;
+  return Object.assign({}, job, {
+    co: job.co || job.company_name || job.company || "Employer",
+    loc: job.loc || job.location || "Location TBD",
+    sched: job.sched || job.schedule || "Flexible schedule",
+    train: job.train || job.training || "Training provided",
+    desc: job.desc || job.description || "",
+    clr: job.clr || "#3B82F6",
+    logo: job.logo || <FaBriefcase />,
+    tags: Array.isArray(job.tags) ? job.tags : [],
+    qs: parseJobQuestions(job.qs || job.questions)
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -562,7 +673,7 @@ function StudentApp(props){
   // Load real data from Supabase when connected
   useEffect(function(){
     if(!sb||!props.user)return;
-    dbLoadJobs().then(function(data){if(data&&data.length)setJobs(data);});
+    dbLoadJobs().then(function(data){if(data&&data.length)setJobs(data.map(normalizeJob));});
     dbLoadMyApps(props.user.uid).then(function(data){
       if(!data)return;
       var mapped=data.map(function(a){
@@ -701,7 +812,8 @@ function StudentApp(props){
     profile: <><FaUser /> My Profile</>
   };
 
-  var qs=applyJob?(applyJob.qs||[]):[];
+  var applyCompany=applyJob?(applyJob.co||applyJob.company_name||applyJob.company||"Employer"):"";
+  var qs=applyJob?parseJobQuestions(applyJob.qs||applyJob.questions):[];
   var steps=qs.length>0?["Info","Availability","Your Answers","Review"]:["Info","Availability","Review"];
 
   var navItems=[
@@ -798,7 +910,7 @@ function StudentApp(props){
                     <div style={{width:48,height:48,borderRadius:13,background:selJob.clr+"22",border:"2px solid "+selJob.clr+"55",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>{selJob.logo}</div>
                     <div>
                       <h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff",marginBottom:2}}>{selJob.title}</h2>
-                      <p style={{color:MU,fontSize:12}}>{selJob.co} - {selJob.loc}</p>
+                      <p style={{color:MU,fontSize:12}}>{selJob.co||selJob.company_name||selJob.company||"Employer"} - {selJob.loc||selJob.location||"Location TBD"}</p>
                       {area.la&&<p style={{color:PR,fontSize:11,marginTop:2}}><FaMapMarker /> {calcMiles(area.la,area.lo,selJob.la,selJob.lo)} miles away</p>}
                     </div>
                   </div>
@@ -835,7 +947,7 @@ function StudentApp(props){
       {applyJob&&(
         <Modal onClose={function(){setApplyJob(null);}}>
           <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div><p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:2}}>APPLYING TO {applyJob.co.toUpperCase()}</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{applyJob.title}</h2></div>
+            <div><p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:2}}>APPLYING TO {applyCompany.toUpperCase()}</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{applyJob.title}</h2></div>
             <Btn ch="X" v="gh" sm onClick={function(){setApplyJob(null);}}/>
           </div>
           <div style={{padding:"12px 18px 18px"}}>
@@ -844,7 +956,7 @@ function StudentApp(props){
             {applyStep===0&&<div><p style={{color:MU,fontSize:13,marginBottom:9}}>Applying as: {rd.firstName} {rd.lastName} - {rd.school}</p><div style={{display:"flex",gap:9,background:"rgba(0,200,150,0.07)",border:"1px solid "+PR+"33",borderRadius:9,padding:"10px 12px",alignItems:"center"}}><span style={{color:PR,fontSize:12,fontWeight:700}}><FaFileAlt /> {resume?resume.name+" attached":"No resume"}</span></div></div>}
             {applyStep===1&&<div><p style={{color:MU,fontSize:13,marginBottom:9}}>Select days you are available.</p><div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:11}}>{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map(function(d){return <div key={d} className="ni" onClick={function(){setAvail(function(p){return p.includes(d)?p.filter(function(x){return x!==d;}):p.concat([d]);});}} style={{background:avail.includes(d)?PR+"22":"rgba(255,255,255,0.04)",border:"1px solid "+(avail.includes(d)?PR:BR),color:avail.includes(d)?PR:MU,borderRadius:8,padding:"6px 11px",fontSize:12,fontWeight:700}}>{d}</div>;})} </div><Lbl t="NOTE TO EMPLOYER (optional)"/><Txa v={anote} onChange={function(e){setAnote(e.target.value);}} ph="Why you are excited about this role..." h={64}/></div>}
             {applyStep===2&&qs.length>0&&<div><p style={{color:MU,fontSize:13,marginBottom:11}}>Answer the employer questions.</p>{qs.map(function(q2,i){return <div key={i} style={{marginBottom:11}}><Lbl t={"Q"+(i+1)+": "+q2}/><Txa v={aAns[q2]||""} onChange={function(e){var val=e.target.value;setAAns(function(p){return Object.assign({},p,{[q2]:val});});}} ph="Your answer..." h={60}/></div>;})}</div>}
-            {applyStep===steps.length-1&&<div><p style={{color:MU,fontSize:13,marginBottom:11}}>Review before submitting.</p><div style={bx({marginBottom:11})}>{[["Job",applyJob.title+" at "+applyJob.co],["Available",avail.join(", ")||"Not set"],["Resume",resume?resume.name:"None"]].map(function(pair){return <div key={pair[0]} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+BR,fontSize:12}}><span style={{color:MU}}>{pair[0]}</span><span style={{color:"#fff",fontWeight:700}}>{pair[1]}</span></div>;})}</div></div>}
+            {applyStep===steps.length-1&&<div><p style={{color:MU,fontSize:13,marginBottom:11}}>Review before submitting.</p><div style={bx({marginBottom:11})}>{[["Job",applyJob.title+" at "+applyCompany],["Available",avail.join(", ")||"Not set"],["Resume",resume?resume.name:"None"]].map(function(pair){return <div key={pair[0]} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+BR,fontSize:12}}><span style={{color:MU}}>{pair[0]}</span><span style={{color:"#fff",fontWeight:700}}>{pair[1]}</span></div>;})}</div></div>}
             <div style={{display:"flex",gap:8,marginTop:13}}>
               {applyStep>0&&<Btn ch="Back" v="gh" onClick={function(){setApplyStep(function(s){return s-1;});}}/>}
               <Btn ch={loading?"Submitting...":(applyStep<steps.length-1?"Continue":"Submit Application")} lg sx={{flex:1,justifyContent:"center"}} onClick={function(){applyStep<steps.length-1?setApplyStep(function(s){return s+1;}):submitApp();}}/>
@@ -1079,14 +1191,14 @@ function StudentResumePage(props){
 // ─────────────────────────────────────────────────────────────
 function BizApp(props){
   var [nav,setNav]=useState("overview");
-  var [applicants,setApplicants]=useState(LOCAL_APPLICANTS);
+  var [applicants,setApplicants]=useState(sb ? [] : LOCAL_APPLICANTS);
   var [fj,setFj]=useState("all");
   var [selA,setSelA]=useState(null);
   var [showRes,setShowRes]=useState(false);
   var [showIV,setShowIV]=useState(false);
   var [ivDraft,setIvDraft]=useState({date:"",time:"",loc:"",notes:""});
   var [showAdd,setShowAdd]=useState(false);
-  var [myJobs,setMyJobs]=useState(LOCAL_JOBS.filter(function(j){return BIZ_IDS.includes(j.id);}));
+  var [myJobs,setMyJobs]=useState(sb ? [] : LOCAL_JOBS.filter(function(j){return BIZ_IDS.includes(j.id);}));
   var [nj,setNj]=useState({title:"",type:"Part-Time",pay:"",loc:"",sched:"",train:"",desc:"",qs:[""]});
   var [biz,setBiz]=useState({co:props.user?props.user.name:"Houndstooth Coffee",nm:"Sarah Mitchell",email:"sarah@houndstooth.com",phone:"(214) 555-3377",addr:"2817 Commerce St, Dallas TX",web:"houndstoothcoffee.com",ind:"Food and Beverage",size:"11-50 employees",about:"Specialty coffee shop committed to quality and community. We love giving first-time workers their start."});
   var [editB,setEditB]=useState(false);
@@ -1095,26 +1207,35 @@ function BizApp(props){
   // Load real data from Supabase when connected
   useEffect(function(){
     if(!sb||!props.user)return;
-    dbLoadMyJobs(props.user.uid).then(function(data){if(data&&data.length)setMyJobs(data);});
+    dbLoadMyJobs(props.user.uid).then(function(data){
+      if(Array.isArray(data)) setMyJobs(data.map(normalizeJob));
+    });
     dbLoadApplicants(props.user.uid).then(function(data){
-      if(data){
+      if(Array.isArray(data)){
         var mapped = data.map(function(a){
+          var student = a.student || a.students || null;
+          var interviews = Array.isArray(a.interviews) ? a.interviews : [];
+          var firstName = a.profile && a.profile.first_name ? a.profile.first_name : (student && student.first_name ? student.first_name : "");
+          var lastName = a.profile && a.profile.last_name ? a.profile.last_name : (student && student.last_name ? student.last_name : "");
+          var fullName = (firstName + " " + lastName).trim();
           return {
             id: a.id,
             jobId: a.job_id,
-            name: a.students.first_name + ' ' + a.students.last_name,
-            school: a.students.school,
-            grade: a.students.grade,
-            age: a.students.age,
-            email: a.students.email,
-            applied: new Date(a.applied_at).toLocaleDateString(),
+            name: fullName || (student && student.email) || "Student Applicant",
+            school: student && student.school ? student.school : "",
+            grade: student && student.grade ? student.grade : "",
+            age: student && student.age ? student.age : "",
+            email: student && student.email ? student.email : "",
+            applied: a.applied_at ? new Date(a.applied_at).toLocaleDateString() : "Today",
             status: a.status,
             note: a.note,
-            ans: JSON.parse(a.answers || '{}'),
-            iv: a.interviews && a.interviews[0] ? {date: a.interviews[0].interview_date, time: a.interviews[0].interview_time, loc: a.interviews[0].location, notes: a.interviews[0].notes} : null
+            ans: parseJsonObject(a.answers),
+            iv: interviews[0] ? {date: interviews[0].interview_date, time: interviews[0].interview_time, loc: interviews[0].location, notes: interviews[0].notes} : null
           };
         });
         setApplicants(mapped);
+      } else {
+        setApplicants([]);
       }
     });
   },[props.user]);
