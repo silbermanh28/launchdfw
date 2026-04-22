@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { FaUser, FaEnvelope, FaCheck, FaHeart, FaStar, FaFootballBall, FaPlane, FaMugHot, FaClipboard, FaHourglassHalf, FaTimes, FaCoffee, FaLaptop, FaFutbol, FaCamera, FaBook, FaBuilding, FaShoppingCart, FaPaw, FaSoap, FaUniversity, FaChartLine, FaPen, FaBasketballBall, FaDrumstickBite, FaHospital, FaShoppingBag, FaCar, FaFilm, FaLeaf, FaGraduationCap, FaExclamationTriangle, FaLock, FaDoorOpen, FaArrowLeft, FaHome, FaFileAlt, FaCalendar, FaUsers, FaBriefcase, FaMapMarker, FaQuestion, FaSearch, FaClock, FaStickyNote, FaLightbulb, FaMicrophone, FaTrophy, FaUpload, FaWrench, FaPalette, FaRegHeart } from "react-icons/fa";
+import { FaUser, FaEnvelope, FaCheck, FaHeart, FaStar, FaFootballBall, FaPlane, FaMugHot, FaClipboard, FaHourglassHalf, FaTimes, FaCoffee, FaLaptop, FaFutbol, FaCamera, FaBook, FaBuilding, FaShoppingCart, FaPaw, FaSoap, FaUniversity, FaChartLine, FaPen, FaBasketballBall, FaDrumstickBite, FaHospital, FaShoppingBag, FaCar, FaFilm, FaLeaf, FaGraduationCap, FaExclamationTriangle, FaLock, FaDoorOpen, FaArrowLeft, FaHome, FaFileAlt, FaCalendar, FaUsers, FaBriefcase, FaMapMarker, FaQuestion, FaSearch, FaClock, FaStickyNote, FaLightbulb, FaMicrophone, FaTrophy, FaUpload, FaWrench, FaPalette, FaRegHeart, FaBell, FaCommentDots, FaPaperPlane, FaDownload, FaFlag, FaCheckCircle } from "react-icons/fa";
 import { supabase } from "./supabaseClient";
 
 // ─────────────────────────────────────────────────────────────
@@ -38,6 +38,7 @@ async function dbSignUp(email, password, role, extra) {
     });
     if (studentRes.error) return { error: studentRes.error.message };
   } else {
+    var verificationMeta = getEmployerVerificationMetadata(email, extra.website || "", "pending");
     var employerRes = await sb.from("employers").insert({
       id: uid,
       company_name: extra.company || "",
@@ -48,7 +49,10 @@ async function dbSignUp(email, password, role, extra) {
       website: extra.website || "",
       industry: extra.industry || "",
       company_size: extra.companySize || "",
-      about: extra.about || ""
+      about: extra.about || "",
+      verification_status: verificationMeta.status,
+      email_domain_match: verificationMeta.emailDomainMatch,
+      verification_signal: verificationMeta.verificationSignal
     });
     if (employerRes.error) return { error: employerRes.error.message };
   }
@@ -70,7 +74,27 @@ async function dbLoadJobs() {
   if (!sb) return null;
   var res = await sb.from("jobs").select("*").eq("is_active", true).order("posted_at", { ascending: false });
   if (res.error) { console.error(res.error); return null; }
-  return res.data;
+  var jobs = res.data || [];
+  var employerIds = Array.from(new Set(jobs.map(function(job){ return job.employer_id; }).filter(Boolean)));
+  var employersById = {};
+  if (employerIds.length > 0) {
+    var employerRes = await sb.from("employers").select("id,verification_status,email_domain_match,verification_signal").in("id", employerIds);
+    if (!employerRes.error && Array.isArray(employerRes.data)) {
+      employerRes.data.forEach(function(employer){
+        employersById[employer.id] = employer;
+      });
+    } else if (employerRes.error) {
+      console.warn("dbLoadJobs employers error", employerRes.error);
+    }
+  }
+  return jobs.map(function(job){
+    var employer = employersById[job.employer_id] || {};
+    return Object.assign({}, job, {
+      verificationStatus: employer.verification_status || "pending",
+      emailDomainMatch: !!employer.email_domain_match,
+      verificationSignal: employer.verification_signal || ""
+    });
+  });
 }
 
 async function dbLoadMyApps(studentId) {
@@ -89,8 +113,8 @@ async function dbSubmitApp(jobId, studentId, availability, note, answers) {
     note: note,
     answers: answers || {},
     status: "pending"
-  });
-  return res.error ? { error: res.error.message } : { ok: true };
+  }).select("*").single();
+  return res.error ? { error: res.error.message } : { ok: true, data: res.data };
 }
 
 async function dbSaveJob(studentId, jobId) {
@@ -170,8 +194,9 @@ async function dbSaveProfile(studentId, profileData) {
 
 async function dbUploadResume(uid, file) {
   if (!sb) return { error: "not_connected" };
-  const fileName = `${uid}/${file.name}`;
-  const { error } = await sb.storage.from('resumes').upload(fileName, file);
+  var safeName = file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+  const fileName = `${uid}/${Date.now()}-${safeName}`;
+  const { error } = await sb.storage.from('resumes').upload(fileName, file, { upsert: true });
   if (error) return { error: error.message };
   const { data: urlData } = sb.storage.from('resumes').getPublicUrl(fileName);
   return { url: urlData.publicUrl };
@@ -180,19 +205,25 @@ async function dbUploadResume(uid, file) {
 // Employer functions
 async function dbLoadMyJobs(employerId) {
   if (!sb) return null;
-  var res = await sb.from("jobs").select("*").eq("employer_id", employerId);
+  var res = await sb.from("jobs").select("*").eq("employer_id", employerId).eq("is_active", true);
   return res.error ? null : res.data;
 }
 
 async function dbPostJob(employerId, job) {
   if (!sb) return { error: "not_connected" };
-  var res = await sb.from("jobs").insert(Object.assign({}, job, { employer_id: employerId, is_active: true }));
-  return res.error ? { error: res.error.message } : { ok: true };
+  var res = await sb.from("jobs").insert(Object.assign({}, job, { employer_id: employerId, is_active: true })).select("*").single();
+  return res.error ? { error: res.error.message } : { ok: true, data: res.data };
 }
 
 async function dbUpdateJob(employerId, jobId, job) {
   if (!sb) return { error: "not_connected" };
   var res = await sb.from("jobs").update(job).eq("id", jobId).eq("employer_id", employerId);
+  return res.error ? { error: res.error.message } : { ok: true };
+}
+
+async function dbDeleteJob(employerId, jobId) {
+  if (!sb) return { error: "not_connected" };
+  var res = await sb.from("jobs").update({ is_active: false }).eq("id", jobId).eq("employer_id", employerId);
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
@@ -209,24 +240,29 @@ async function dbLoadEmployerProfile(employerId) {
 
 async function dbSaveEmployerProfile(employerId, bizData) {
   if (!sb) return { error: "not_connected" };
-  var nameParts = splitName(bizData.nm);
+  var normalizedBiz = createBusinessProfile(bizData);
+  var verificationMeta = getEmployerVerificationMetadata(normalizedBiz.email, normalizedBiz.web, normalizedBiz.verificationStatus);
+  var nameParts = splitName(normalizedBiz.nm);
   var profileRes = await sb.from("profiles").update({
     first_name: nameParts.firstName,
     last_name: nameParts.lastName,
-    email: bizData.email
+    email: normalizedBiz.email
   }).eq("id", employerId);
   if (profileRes.error) return { error: profileRes.error.message };
 
   var employerRes = await sb.from("employers").update({
-    company_name: bizData.co,
-    contact_name: bizData.nm,
-    email: bizData.email,
-    phone: bizData.phone,
-    address: bizData.addr,
-    website: bizData.web,
-    industry: bizData.ind,
-    company_size: bizData.size,
-    about: bizData.about
+    company_name: normalizedBiz.co,
+    contact_name: normalizedBiz.nm,
+    email: normalizedBiz.email,
+    phone: normalizedBiz.phone,
+    address: normalizedBiz.addr,
+    website: normalizedBiz.web,
+    industry: normalizedBiz.ind,
+    company_size: normalizedBiz.size,
+    about: normalizedBiz.about,
+    verification_status: verificationMeta.status,
+    email_domain_match: verificationMeta.emailDomainMatch,
+    verification_signal: verificationMeta.verificationSignal
   }).eq("id", employerId);
   if (employerRes.error) return { error: employerRes.error.message };
   return { ok: true };
@@ -308,9 +344,24 @@ async function dbUpdateAppStatus(appId, status) {
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
+async function dbAppendApplicationMessage(appId, message) {
+  if (!sb) return { error: "not_connected" };
+  var currentRes = await sb.from("applications").select("messages").eq("id", appId).maybeSingle();
+  if (currentRes.error) return { error: currentRes.error.message };
+  var current = Array.isArray(currentRes.data && currentRes.data.messages) ? currentRes.data.messages : [];
+  var next = current.concat([message]);
+  var saveRes = await sb.from("applications").update({ messages: next }).eq("id", appId);
+  return saveRes.error ? { error: saveRes.error.message } : { ok: true };
+}
+
 async function dbScheduleInterview(appId, ivData) {
   if (!sb) return { error: "not_connected" };
-  var res = await sb.from("interviews").upsert({ application_id: appId, interview_date: ivData.interview_date, interview_time: ivData.interview_time, location: ivData.location, notes: ivData.notes });
+  var existing = await sb.from("interviews").select("id").eq("application_id", appId).maybeSingle();
+  if (existing.error) return { error: existing.error.message };
+  var payload = { application_id: appId, interview_date: ivData.interview_date, interview_time: ivData.interview_time, location: ivData.location, notes: ivData.notes };
+  var res = existing.data
+    ? await sb.from("interviews").update(payload).eq("id", existing.data.id)
+    : await sb.from("interviews").insert(payload);
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
@@ -362,6 +413,48 @@ function buildFullName(firstName, lastName) {
   return [firstName, lastName].filter(Boolean).join(" ").trim();
 }
 
+var PERSONAL_EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","hotmail.com","icloud.com","aol.com","me.com","live.com","msn.com","proton.me","protonmail.com"];
+
+function normalizeDomain(value) {
+  if (!value) return "";
+  var text = String(value).trim().toLowerCase();
+  text = text.replace(/^mailto:/, "");
+  if (!/^https?:\/\//.test(text) && !text.includes("@")) text = "https://" + text;
+  if (text.includes("@")) {
+    return text.split("@").pop().split(/[/?#]/)[0].replace(/^www\./, "").trim();
+  }
+  try {
+    return new URL(text).hostname.replace(/^www\./, "").trim();
+  } catch {
+    return text.replace(/^https?:\/\//, "").split("/")[0].split("?")[0].split("#")[0].replace(/^www\./, "").trim();
+  }
+}
+
+function domainsMatch(emailDomain, websiteDomain) {
+  if (!emailDomain || !websiteDomain) return false;
+  return emailDomain === websiteDomain || emailDomain.endsWith("." + websiteDomain) || websiteDomain.endsWith("." + emailDomain);
+}
+
+function getEmployerVerificationMetadata(email, website, currentStatus) {
+  var emailDomain = normalizeDomain(email);
+  var websiteDomain = normalizeDomain(website);
+  var isPersonal = PERSONAL_EMAIL_DOMAINS.includes(emailDomain);
+  var emailDomainMatch = !isPersonal && domainsMatch(emailDomain, websiteDomain);
+  var manualStatus = currentStatus === "approved" || currentStatus === "rejected" ? currentStatus : "pending";
+  var verificationSignal = !websiteDomain ? "missing_website" : isPersonal ? "personal_email" : emailDomainMatch ? "domain_match" : "domain_mismatch";
+  return {
+    status: manualStatus,
+    emailDomainMatch: emailDomainMatch,
+    verificationSignal: verificationSignal
+  };
+}
+
+function normalizeAppRole(role) {
+  if (role === "employer") return "business";
+  if (role === "business" || role === "student") return role;
+  return "login";
+}
+
 function createStudentProfile(extra) {
   return {
     firstName: extra.firstName || "Alex",
@@ -394,21 +487,25 @@ function createResumeData(extra) {
 }
 
 function createBusinessProfile(extra) {
+  var nameParts = extra.nm ? splitName(extra.nm) : { firstName: extra.firstName || "", lastName: extra.lastName || "" };
   return {
-    co: extra.company || "Houndstooth Coffee",
-    nm: buildFullName(extra.firstName, extra.lastName) || "Sarah Mitchell",
-    email: extra.email || "sarah@houndstooth.com",
-    phone: extra.phone || "(214) 555-3377",
-    addr: extra.address || "2817 Commerce St, Dallas TX",
-    web: extra.website || "houndstoothcoffee.com",
-    ind: extra.industry || "Food and Beverage",
-    size: extra.companySize || "11-50 employees",
-    about: extra.about || "Specialty coffee shop committed to quality and community. We love giving first-time workers their start."
+    co: extra.co || extra.company || "",
+    nm: extra.nm || buildFullName(nameParts.firstName, nameParts.lastName) || "",
+    email: extra.email || "",
+    phone: extra.phone || "",
+    addr: extra.addr || extra.address || "",
+    web: extra.web || extra.website || "",
+    ind: extra.ind || extra.industry || "",
+    size: extra.size || extra.companySize || "",
+    about: extra.about || "",
+    verificationStatus: extra.verificationStatus || extra.verification_status || "pending",
+    emailDomainMatch: extra.emailDomainMatch != null ? !!extra.emailDomainMatch : !!extra.email_domain_match,
+    verificationSignal: extra.verificationSignal || extra.verification_signal || ""
   };
 }
 
 function createEmptyJobDraft() {
-  return { title:"", type:"Part-Time", pay:"", loc:"", sched:"", train:"", desc:"", qs:[""], spots:1 };
+  return { title:"", type:"Part-Time", pay:"", loc:"", sched:"", train:"", desc:"", qs:[""], spots:1, tags:[], areaLabel:"Select area..." };
 }
 
 function jobToDraft(job) {
@@ -421,27 +518,62 @@ function jobToDraft(job) {
     train: job.train || job.training || "",
     desc: job.desc || job.description || "",
     qs: parseJobQuestions(job.qs || job.questions).length ? parseJobQuestions(job.qs || job.questions) : [""],
-    spots: job.spots || 1
+    spots: job.spots || 1,
+    tags: Array.isArray(job.tags) ? job.tags : [],
+    areaLabel: job.areaLabel || job.area_label || inferAreaLabelFromJob(job)
   };
+}
+
+function resolveJobLogo(job) {
+  if (job && job.iconKey === "star") return <FaStar />;
+  if (job && job.logo && typeof job.logo === "object" && job.logo.$$typeof) return job.logo;
+  return <FaBriefcase />;
+}
+
+function resolveAreaByLabel(label) {
+  return AREAS.find(function(area){ return area.l === label; }) || null;
+}
+
+function inferAreaLabelFromJob(job) {
+  if (job && (job.areaLabel || job.area_label)) return job.areaLabel || job.area_label;
+  if (!job || !job.loc) return "Select area...";
+  var lower = String(job.loc).toLowerCase();
+  var match = AREAS.find(function(area){
+    return area.la != null && lower.includes(area.l.toLowerCase().replace(", tx", "").replace("downtown ", "").replace("uptown ", ""));
+  });
+  return match ? match.l : "Select area...";
+}
+
+function getJobCoordinates(job) {
+  if (job && job.la != null && job.lo != null) return { la: job.la, lo: job.lo };
+  var area = resolveAreaByLabel(inferAreaLabelFromJob(job));
+  return area && area.la != null ? { la: area.la, lo: area.lo } : { la: null, lo: null };
 }
 
 function normalizeJob(job) {
   if (!job) return job;
+  var coords = getJobCoordinates(job);
   return Object.assign({}, job, {
     co: job.co || job.company_name || job.company || "Employer",
+    employerOwnerId: job.employerOwnerId || job.employer_id || null,
     loc: job.loc || job.location || "Location TBD",
     sched: job.sched || job.schedule || "Flexible schedule",
     train: job.train || job.training || "Training provided",
     desc: job.desc || job.description || "",
     clr: job.clr || "#3B82F6",
-    logo: job.logo || <FaBriefcase />,
+    logo: resolveJobLogo(job),
+    la: coords.la,
+    lo: coords.lo,
+    areaLabel: job.areaLabel || job.area_label || inferAreaLabelFromJob(job),
+    spots: parseInt(job.spots, 10) || 1,
     tags: Array.isArray(job.tags) ? job.tags : [],
     qs: parseJobQuestions(job.qs || job.questions)
   });
 }
 
 // ─────────────────────────────────────────────────────────────
-// LOCAL FALLBACK DATA (used when Supabase is not connected yet)
+// LOCAL FALLBACK DATA
+// Intentionally empty so students only see jobs created by businesses.
 // ─────────────────────────────────────────────────────────────
 var AREAS = [
   {l:"Select area...",la:null,lo:null},
@@ -452,51 +584,314 @@ var AREAS = [
   {l:"McKinney",la:33.197,lo:-96.64},{l:"Allen",la:33.103,lo:-96.671},
 ];
 
-var LOCAL_JOBS = [
-  {id:1,co:"Houndstooth Coffee",title:"Barista Trainee",type:"Part-Time",pay:"$13-15/hr",tags:["No Exp","16+"],logo:<FaCoffee />,clr:"#F59E0B",loc:"Uptown Dallas",la:32.793,lo:-96.807,sched:"Weekends + After School",train:"Full training",desc:"Learn specialty coffee from espresso to latte art. Fun team, great tips.",posted:"Today",spots:3,qs:["What days can you work?","Any customer service experience?"]},
-  {id:28,co:"Houndstooth Coffee",title:"Shift Supervisor Trainee",type:"Part-Time",pay:"$15-17/hr",tags:["18+","Leadership"],logo:<FaCoffee />,clr:"#F59E0B",loc:"Deep Ellum",la:32.786,lo:-96.784,sched:"Weekday mornings",train:"Leadership mentorship",desc:"Lead a team and grow. We promote from within.",posted:"Today",spots:1,qs:["Describe a time you led a group.","Available mornings?"]},
-  {id:29,co:"Houndstooth Coffee",title:"Pastry Counter Associate",type:"Part-Time",pay:"$12-14/hr",tags:["No Exp","16+"],logo:<FaCoffee />,clr:"#F59E0B",loc:"Park Cities",la:32.843,lo:-96.799,sched:"Mon-Sat 6am-11am",train:"Food handler cert",desc:"Assist with pastry display and customer orders.",posted:"2d ago",spots:2,qs:["Comfortable with early morning shifts?"]},
-  {id:2,co:"AT&T",title:"Junior IT Intern",type:"Internship",pay:"$18/hr",tags:["College","Tech"],logo:<FaLaptop />,clr:"#3B82F6",loc:"Downtown Dallas",la:32.777,lo:-96.797,sched:"Mon-Fri 9am-3pm",train:"Full mentorship",desc:"Work on real infrastructure projects alongside engineers.",posted:"1d ago",spots:2,qs:["What programming languages do you know?"]},
-  {id:3,co:"Dallas YMCA",title:"Youth Sports Coach",type:"Part-Time",pay:"$12/hr",tags:["No Exp","16+"],logo:<FaFutbol />,clr:"#10B981",loc:"Plano, TX",la:33.02,lo:-96.699,sched:"Saturdays 8am-2pm",train:"CPR cert provided",desc:"Lead youth basketball and soccer for kids 6-12.",posted:"3d ago",spots:5,qs:[]},
-  {id:4,co:"Visit Dallas",title:"Social Media Intern",type:"Internship",pay:"$15/hr",tags:["Creative","College"],logo:<FaCamera />,clr:"#8B5CF6",loc:"Deep Ellum",la:32.786,lo:-96.784,sched:"Flexible 15 hrs/wk",train:"Creative mentorship",desc:"Create content showcasing Dallas culture and events.",posted:"Today",spots:1,qs:["Share a social account you admire and why."]},
-  {id:5,co:"Dallas Public Library",title:"Library Page",type:"Part-Time",pay:"$11/hr",tags:["14+","No Exp"],logo:<FaBook />,clr:"#EF4444",loc:"Multiple Locations",la:32.801,lo:-96.797,sched:"After school + Sat",train:"On-the-job training",desc:"Help organize the collection and assist visitors.",posted:"4d ago",spots:8,qs:[]},
-  {id:6,co:"Marriott Hotels",title:"Front Desk Associate",type:"Part-Time",pay:"$14/hr",tags:["18+","Hospitality"],logo:<FaBuilding />,clr:"#06B6D4",loc:"Las Colinas",la:32.866,lo:-96.955,sched:"Evenings and Weekends",train:"Paid orientation",desc:"Greet guests and manage check-ins.",posted:"2d ago",spots:4,qs:["How would you handle an upset guest?"]},
-  {id:7,co:"Southwest Airlines",title:"Marketing Intern",type:"Internship",pay:"$20/hr",tags:["College","Marketing"],logo:<FaPlane />,clr:"#EF4444",loc:"Love Field",la:32.847,lo:-96.852,sched:"Mon-Fri full summer",train:"Corporate mentorship",desc:"Join the marketing team at one of America's most iconic airlines.",posted:"Today",spots:2,qs:["Describe a campaign you have worked on."]},
-  {id:8,co:"Tom Thumb",title:"Grocery Stock Associate",type:"Part-Time",pay:"$12.50/hr",tags:["16+","No Exp"],logo:<FaShoppingCart />,clr:"#84CC16",loc:"Richardson, TX",la:32.948,lo:-96.73,sched:"Evenings 4-10pm",train:"Same-day training",desc:"Keep shelves stocked and the store organized.",posted:"1d ago",spots:10,qs:[]},
-  {id:9,co:"VCA Animal Hospitals",title:"Pet Care Assistant",type:"Part-Time",pay:"$13/hr",tags:["16+","No Exp"],logo:<FaPaw />,clr:"#F97316",loc:"Frisco, TX",la:33.151,lo:-96.824,sched:"Weekends + 1 weekday",train:"Vet team mentorship",desc:"Help care for animals and assist veterinary staff.",posted:"Today",spots:2,qs:["Why do you want to work with animals?"]},
-  {id:10,co:"H-E-B",title:"Cashier",type:"Part-Time",pay:"$12/hr",tags:["16+","No Exp"],logo:<FaSoap />,clr:"#E11D48",loc:"McKinney, TX",la:33.197,lo:-96.64,sched:"Flexible any shift",train:"Paid training week",desc:"Greet customers and process transactions.",posted:"1d ago",spots:12,qs:[]},
-  {id:11,co:"Chase Bank",title:"Bank Teller Trainee",type:"Part-Time",pay:"$14/hr",tags:["18+","No Exp"],logo:<FaUniversity />,clr:"#1D4ED8",loc:"Irving, TX",la:32.814,lo:-96.949,sched:"Mon-Sat flexible",train:"2-week onboarding",desc:"Assist customers with transactions and account questions.",posted:"2d ago",spots:5,qs:[]},
-  {id:12,co:"Deloitte Dallas",title:"Office Admin Intern",type:"Internship",pay:"$19/hr",tags:["College","Business"],logo:<FaChartLine />,clr:"#1E40AF",loc:"Uptown Dallas",la:32.793,lo:-96.807,sched:"Mon-Fri 9am-5pm",train:"Professional dev program",desc:"Support Deloitte's Dallas office. A prestigious resume builder.",posted:"1d ago",spots:3,qs:["Why are you interested in professional services?"]},
-  {id:13,co:"AT&T Stadium",title:"Game Day Event Staff",type:"Seasonal",pay:"$13/hr",tags:["18+","Events","Sports"],logo:<FaFootballBall />,clr:"#003594",loc:"Arlington, TX",la:32.748,lo:-97.094,sched:"Game days and events",train:"Event orientation",desc:"Work Cowboys games and concerts at one of the world's most iconic stadiums.",posted:"3d ago",spots:30,qs:[]},
-  {id:14,co:"Kumon Learning Center",title:"Tutoring Assistant",type:"Part-Time",pay:"$12/hr",tags:["16+","Academic"],logo:<FaPen />,clr:"#EC4899",loc:"Frisco and Plano",la:33.085,lo:-96.761,sched:"Mon-Thu 3-7pm",train:"Kumon method training",desc:"Help younger students with math and reading.",posted:"5d ago",spots:3,qs:[]},
-  {id:15,co:"Dallas Mavericks",title:"Game Night Crew Member",type:"Seasonal",pay:"$13/hr",tags:["18+","Events","Sports"],logo:<FaBasketballBall />,clr:"#006BB6",loc:"Downtown Dallas",la:32.790,lo:-96.810,sched:"Home game nights",train:"Arena orientation",desc:"Work home games at American Airlines Center and create an amazing fan experience.",posted:"Today",spots:20,qs:[]},
-  {id:16,co:"Chick-fil-A",title:"Team Member",type:"Part-Time",pay:"$13-14/hr",tags:["No Exp","16+","Flexible"],logo:<FaDrumstickBite />,clr:"#E51636",loc:"Multiple DFW Locations",la:32.900,lo:-96.750,sched:"Flexible including weekends",train:"Same-day training",desc:"Join the brand known for the best customer service in fast food.",posted:"Today",spots:15,qs:[]},
-  {id:17,co:"Starbucks",title:"Barista",type:"Part-Time",pay:"$13-15/hr",tags:["No Exp","16+","Benefits"],logo:<FaMugHot />,clr:"#00704A",loc:"Plano, TX",la:33.020,lo:-96.699,sched:"Flexible including mornings",train:"Full barista training",desc:"Join the iconic green apron team and learn drinks, customer connection, and teamwork.",posted:"1d ago",spots:5,qs:[]},
-  {id:18,co:"Children's Health",title:"Hospital Volunteer Intern",type:"Internship",pay:"Stipend",tags:["College","Healthcare"],logo:<FaHospital />,clr:"#0072CE",loc:"Dallas Medical District",la:32.812,lo:-96.840,sched:"Flexible weekdays",train:"Clinical mentorship",desc:"Shadow healthcare professionals at one of the nation's top pediatric hospitals.",posted:"Today",spots:4,qs:["What healthcare field interests you most?","Are you comfortable in a hospital?"]},
-  {id:19,co:"Target",title:"Sales Floor Team Member",type:"Part-Time",pay:"$15/hr",tags:["16+","No Exp","Flexible"],logo:<FaShoppingBag />,clr:"#CC0000",loc:"Garland, TX",la:32.913,lo:-96.639,sched:"Flexible scheduling",train:"Week-long paid onboarding",desc:"Help guests find what they need and create a great shopping experience.",posted:"2d ago",spots:10,qs:[]},
-  {id:20,co:"Tesla",title:"Service Center Intern",type:"Internship",pay:"$18/hr",tags:["College","Tech","STEM"],logo:<FaCar />,clr:"#CC0000",loc:"North Dallas",la:32.950,lo:-96.800,sched:"Mon-Fri 9am-4pm",train:"EV technology training",desc:"Learn electric vehicle service and diagnostics at one of Tesla's Dallas service centers.",posted:"Today",spots:2,qs:["What interests you about electric vehicles?"]},
-  {id:21,co:"City of Dallas Parks",title:"Summer Recreation Leader",type:"Seasonal",pay:"$13/hr",tags:["16+","Summer","Outdoors"],logo:<FaLeaf />,clr:"#27AE60",loc:"Dallas Parks - Various",la:32.790,lo:-96.820,sched:"Mon-Fri Jun-Aug",train:"Recreation leadership cert",desc:"Lead games and activities for youth at Dallas community centers all summer.",posted:"1d ago",spots:12,qs:[]},
-  {id:22,co:"AMC Theatres",title:"Team Member",type:"Part-Time",pay:"$11-12/hr",tags:["16+","No Exp","Evenings"],logo:<FaFilm />,clr:"#FF0000",loc:"Mesquite, TX",la:32.767,lo:-96.599,sched:"Evenings and weekends",train:"On-site training",desc:"Work at the movies! Sell tickets, run concessions, and help guests have an amazing night.",posted:"4d ago",spots:7,qs:[]},
-];
+var LOCAL_JOBS = [];
 
-var BIZ_IDS = [1, 28, 29];
+var LOCAL_APPS = [];
 
-var LOCAL_APPS = [
-  {id:"app-2",jobId:2,status:"accepted",applied:"Mar 10",note:"Great profile! We would love to have you join us.",iv:{date:"Apr 5, 2026",time:"2:00 PM",loc:"AT&T Downtown Office, 208 S. Akard St",notes:"Bring your resume and arrive 10 minutes early."}},
-  {id:"app-5",jobId:5,status:"declined",applied:"Mar 8",note:"Position filled this cycle. Apply again next semester!",iv:null},
-  {id:"app-9",jobId:9,status:"pending",applied:"Mar 20",note:"",iv:null},
-];
-
-var LOCAL_APPLICANTS = [
-  {id:1,jobId:1,name:"Jordan Lee",school:"W.T. White HS",grade:"10th",age:"16",email:"jordan@email.com",applied:"Mar 25",status:"pending",note:"I love coffee and work every weekend!",ans:{"What days can you work?":"Fri, Sat, Sun","Any customer service experience?":"I volunteer at my church welcome desk."},iv:null},
-  {id:2,jobId:1,name:"Sofia Reyes",school:"Kimball HS",grade:"11th",age:"17",email:"sofia.r@email.com",applied:"Mar 26",status:"pending",note:"",ans:{"What days can you work?":"Sat and Sun","Any customer service experience?":"Yes, at my school carnival food stand."},iv:null},
-  {id:3,jobId:28,name:"Marcus Green",school:"Skyline HS",grade:"12th",age:"18",email:"marcus.g@email.com",applied:"Mar 24",status:"pending",note:"Been team captain for two years.",ans:{"Describe a time you led a group.":"Led a 5-person AP History project.","Available mornings?":"Yes, up at 5am for swim practice."},iv:null},
-  {id:4,jobId:29,name:"Tyler Brooks",school:"Lake Highlands HS",grade:"9th",age:"15",email:"tyler.b@email.com",applied:"Mar 20",status:"pending",note:"",ans:{"Comfortable with early morning shifts?":"Yes, I wake up early for school."},iv:null},
-];
+var LOCAL_APPLICANTS = [];
 
 var PRESET_SKILLS = ["Customer Service","Teamwork","Communication","Microsoft Office","Google Workspace","Canva","Social Media","Photography","Public Speaking","Leadership","Time Management","Sales","Cash Handling","Data Entry","Excel","Spanish","Research","Writing","First Aid / CPR","Animal Care","Childcare","Cooking","Coding","Math Tutoring","Event Planning"];
+var JOB_FILTER_TAGS = ["No Exp","16+","18+","College","STEM","Creative","Healthcare","Sports","Events","Outdoors"];
 
 var EX_DATA = {firstName:"Morgan",lastName:"Taylor",email:"morgan.taylor@gmail.com",phone:"(214) 555-8834",school:"Jesuit College Prep",grade:"12th Grade",gpa:"3.9",summary:"Detail-oriented senior with leadership experience. Starting UT Austin Fall 2026.",skills:["Customer Service","Excel","Canva","Public Speaking","Bilingual Spanish"],activities:["Student Council President","National Honor Society VP","Varsity Cross Country Captain"],experience:[{role:"Sales Associate",org:"Barnes and Noble",dates:"Aug 2024-Present",desc:"Assisted customers, ran POS system. Employee of the Month Dec 2024."},{role:"Camp Counselor",org:"City of Dallas",dates:"Jun-Aug 2024",desc:"Led STEM activities for 25 campers with a team of 6 counselors."},{role:"Tutor",org:"Schoolhouse.world",dates:"Sep 2023-Present",desc:"Helped 4 students improve from C to A in math and English."}]};
+
+var SHARED_STORE_KEY = "launchdfw_shared_state_v4";
+var SHARED_EVENT = "launchdfw-shared-updated";
+
+function formatShortDateTime(date) {
+  return new Date(date).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+}
+
+function isDocumentResume(url) {
+  return typeof url === "string" && /\.docx?(\?|#|$)/i.test(url);
+}
+
+function getResumePreviewUrl(url) {
+  if (!url) return "";
+  if (isDocumentResume(url)) {
+    return "https://view.officeapps.live.com/op/embed.aspx?src=" + encodeURIComponent(url);
+  }
+  return url;
+}
+
+function safeParseJson(value, fallback) {
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function getDefaultDeadline(jobId) {
+  var base = new Date("2026-04-28T12:00:00");
+  base.setDate(base.getDate() + (parseInt(jobId, 10) % 6));
+  return base.toISOString();
+}
+
+function getDaysUntil(dateValue) {
+  var now = new Date();
+  var then = new Date(dateValue);
+  return Math.ceil((then - now) / 86400000);
+}
+
+function getEmployerVerificationStatus() {
+  return "pending";
+}
+
+function getVerificationBadge(status) {
+  return status === "approved"
+    ? { text:"Verified Employer", color:PR, bg:PR+"16" }
+    : status === "rejected"
+      ? { text:"Verification Rejected", color:DN, bg:DN+"16" }
+      : { text:"Pending Verification", color:WN, bg:"rgba(245,158,11,0.08)" };
+}
+
+function createSharedState() {
+  return {
+    applications: [],
+    customJobs: [],
+    jobOverrides: {},
+    jobViews: {},
+    notifications: [],
+    onboardingSeen: {},
+    savedDeadlineAlerts: {},
+    employerProfiles: {}
+  };
+}
+
+function readSharedState() {
+  if (typeof window === "undefined") return createSharedState();
+  var stored = safeParseJson(localStorage.getItem(SHARED_STORE_KEY), null);
+  if (!stored || typeof stored !== "object") {
+    stored = createSharedState();
+    localStorage.setItem(SHARED_STORE_KEY, JSON.stringify(stored));
+  }
+  if (Array.isArray(stored.customJobs)) {
+    stored.customJobs = stored.customJobs.map(function(job) {
+      if (!job || typeof job !== "object") return job;
+      var nextJob = Object.assign({}, job);
+      if (nextJob.logo && typeof nextJob.logo === "object" && !nextJob.logo.$$typeof) delete nextJob.logo;
+      if (!nextJob.iconKey && nextJob.employerOwnerId) nextJob.iconKey = "star";
+      return nextJob;
+    });
+  }
+  return Object.assign(createSharedState(), stored);
+}
+
+function writeSharedState(state) {
+  if (typeof window === "undefined") return state;
+  localStorage.setItem(SHARED_STORE_KEY, JSON.stringify(state));
+  window.dispatchEvent(new Event(SHARED_EVENT));
+  return state;
+}
+
+function updateSharedState(updater) {
+  var current = readSharedState();
+  var next = updater(current);
+  return writeSharedState(next);
+}
+
+function bindSharedStateListener(onChange) {
+  function handleSharedEvent(){ onChange(); }
+  function handleStorage(event){
+    if(event.key === SHARED_STORE_KEY) onChange();
+  }
+  window.addEventListener(SHARED_EVENT, handleSharedEvent);
+  window.addEventListener("storage", handleStorage);
+  return function(){
+    window.removeEventListener(SHARED_EVENT, handleSharedEvent);
+    window.removeEventListener("storage", handleStorage);
+  };
+}
+
+function applySharedJobs(baseJobs, includeCustomJobs) {
+  if (includeCustomJobs === undefined) includeCustomJobs = true;
+  var state = readSharedState();
+  var withOverrides = baseJobs.map(function(job) {
+    var override = state.jobOverrides[job.id] || {};
+    return normalizeJob(Object.assign({}, job, override, {
+      verificationStatus: override.verificationStatus || job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer"),
+      deadline: override.deadline || job.deadline || getDefaultDeadline(job.id)
+    }));
+  });
+  var customJobs = includeCustomJobs ? (state.customJobs || []).map(function(job) {
+    return normalizeJob(Object.assign({}, job, {
+      verificationStatus: job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer"),
+      deadline: job.deadline || getDefaultDeadline(job.id)
+    }));
+  }) : [];
+  var baseIds = withOverrides.map(function(job){ return String(job.id); });
+  return withOverrides.concat(customJobs.filter(function(job){ return !baseIds.includes(String(job.id)); }));
+}
+
+function getSharedApplicationsForStudent(studentId) {
+  return readSharedState().applications.filter(function(app) { return app.studentId === studentId; });
+}
+
+function getSharedApplicationsForJobs(jobIds) {
+  return readSharedState().applications.filter(function(app) { return jobIds.includes(app.jobId); });
+}
+
+function getSharedApplicationById(appId) {
+  return readSharedState().applications.find(function(app) { return String(app.id) === String(appId); }) || null;
+}
+
+function upsertSharedApplication(appId, updater) {
+  updateSharedState(function(state){
+    var found = false;
+    state.applications = (state.applications || []).map(function(app){
+      if(String(app.id) !== String(appId)) return app;
+      found = true;
+      return updater(app);
+    });
+    if(!found){
+      state.applications = (state.applications || []).concat([updater({ id: appId, messages: [] })]);
+    }
+    return state;
+  });
+}
+
+function addNotification(item) {
+  updateSharedState(function(state) {
+    state.notifications = [{
+      id: "ntf-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      createdAt: new Date().toISOString(),
+      read: false
+    }].concat(state.notifications || []).map(function(entry, idx) {
+      return idx < 80 ? Object.assign({}, entry, item) : entry;
+    }).slice(0, 80);
+    return state;
+  });
+}
+
+function markNotificationsRead(userId, role) {
+  updateSharedState(function(state) {
+    state.notifications = (state.notifications || []).map(function(note) {
+      if (note.userId === userId && note.role === role) return Object.assign({}, note, { read: true });
+      return note;
+    });
+    return state;
+  });
+}
+
+function getProfileCompletion(profile, resume, hasResume) {
+  var checklist = [
+    { key:"firstName", label:"First name", ok:!!profile.firstName },
+    { key:"lastName", label:"Last name", ok:!!profile.lastName },
+    { key:"email", label:"Email", ok:!!profile.email },
+    { key:"phone", label:"Phone", ok:!!profile.phone },
+    { key:"school", label:"School", ok:!!profile.school },
+    { key:"grade", label:"Grade", ok:!!profile.grade },
+    { key:"age", label:"Age", ok:!!profile.age },
+    { key:"bio", label:"Bio", ok:!!profile.bio },
+    { key:"skills", label:"Skills", ok:Array.isArray(profile.skills) && profile.skills.length > 0 },
+    { key:"summary", label:"Resume summary", ok:!!resume.summary },
+    { key:"experience", label:"Experience", ok:Array.isArray(resume.experience) && resume.experience.some(function(ex){return ex.role || ex.org || ex.desc;}) },
+    { key:"resumeFile", label:"Resume upload", ok:!!hasResume }
+  ];
+  var complete = checklist.filter(function(item){ return item.ok; }).length;
+  return {
+    percent: Math.round((complete / checklist.length) * 100),
+    missing: checklist.filter(function(item){ return !item.ok; }).map(function(item){ return item.label; })
+  };
+}
+
+function inferJobSkills(job) {
+  var text = [job.title, job.desc, job.sched, job.train].join(" ").toLowerCase();
+  var tagSkills = (job.tags || []).filter(function(tag){ return PRESET_SKILLS.includes(tag); });
+  var matches = PRESET_SKILLS.filter(function(skill) {
+    var lower = skill.toLowerCase();
+    return text.includes(lower) || (job.tags || []).some(function(tag){ return tag.toLowerCase() === lower; });
+  });
+  if (text.includes("customer")) matches.push("Customer Service");
+  if (text.includes("leader")) matches.push("Leadership");
+  if (text.includes("social")) matches.push("Social Media");
+  if (text.includes("animal")) matches.push("Animal Care");
+  if (text.includes("child") || text.includes("youth")) matches.push("Childcare");
+  if (text.includes("cash")) matches.push("Cash Handling");
+  if (text.includes("tech") || text.includes("coding")) matches.push("Coding");
+  if (text.includes("camera") || text.includes("content")) matches.push("Photography");
+  return Array.from(new Set(tagSkills.concat(matches))).slice(0, 6);
+}
+
+function getSkillGap(profileSkills, job) {
+  var wanted = inferJobSkills(job);
+  var mine = Array.isArray(profileSkills) ? profileSkills : [];
+  return {
+    matched: wanted.filter(function(skill){ return mine.includes(skill); }),
+    missing: wanted.filter(function(skill){ return !mine.includes(skill); }),
+    wanted: wanted
+  };
+}
+
+function scoreJobForStudent(job, profile, apps, area) {
+  var score = 0;
+  var gap = getSkillGap(profile.skills || [], job);
+  score += gap.matched.length * 4;
+  score -= gap.missing.length;
+  if ((job.tags || []).includes("16+") && parseInt(profile.age, 10) >= 16) score += 2;
+  if ((job.tags || []).includes("18+") && parseInt(profile.age, 10) >= 18) score += 2;
+  if ((job.tags || []).includes("College") && String(profile.grade || "").toLowerCase().includes("12")) score += 1;
+  if (profile.school && job.loc && job.loc.toLowerCase().includes("dallas")) score += 1;
+  if (area && area.la && job.la && job.lo) {
+    var miles = calcMiles(area.la, area.lo, job.la, job.lo);
+    score += Math.max(0, 5 - Math.floor(miles / 5));
+  }
+  if (apps.some(function(app){ return app.jobId === job.id && app.status === "accepted"; })) score -= 10;
+  return score;
+}
+
+function escapePdfText(text) {
+  return String(text || "").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function buildResumePdfBlob(resumeData) {
+  var lines = [
+    resumeData.firstName + " " + resumeData.lastName,
+    resumeData.email + " | " + resumeData.phone,
+    resumeData.school + " | " + resumeData.grade + (resumeData.gpa ? " | GPA " + resumeData.gpa : ""),
+    "",
+    "SUMMARY",
+    resumeData.summary || "",
+    "",
+    "SKILLS",
+    (resumeData.skills || []).join(", "),
+    "",
+    "ACTIVITIES",
+    (resumeData.activities || []).join(" | "),
+    "",
+    "EXPERIENCE"
+  ];
+  (resumeData.experience || []).forEach(function(ex) {
+    lines.push((ex.role || "") + (ex.org ? " - " + ex.org : ""));
+    lines.push(ex.dates || "");
+    lines.push(ex.desc || "");
+    lines.push("");
+  });
+  var contentLines = ["BT", "/F1 12 Tf", "50 770 Td"];
+  lines.forEach(function(line, idx) {
+    if (idx > 0) contentLines.push("0 -16 Td");
+    contentLines.push("(" + escapePdfText(line) + ") Tj");
+  });
+  contentLines.push("ET");
+  var stream = contentLines.join("\n");
+  var objects = [];
+  objects.push("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj");
+  objects.push("2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj");
+  objects.push("3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj");
+  objects.push("4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj");
+  objects.push("5 0 obj << /Length " + stream.length + " >> stream\n" + stream + "\nendstream endobj");
+  var pdf = "%PDF-1.4\n";
+  var offsets = [0];
+  objects.forEach(function(obj) {
+    offsets.push(pdf.length);
+    pdf += obj + "\n";
+  });
+  var xref = pdf.length;
+  pdf += "xref\n0 " + (objects.length + 1) + "\n";
+  pdf += "0000000000 65535 f \n";
+  offsets.slice(1).forEach(function(offset) {
+    pdf += String(offset).padStart(10, "0") + " 00000 n \n";
+  });
+  pdf += "trailer << /Size " + (objects.length + 1) + " /Root 1 0 R >>\nstartxref\n" + xref + "\n%%EOF";
+  return new Blob([pdf], { type: "application/pdf" });
+}
 
 // ─────────────────────────────────────────────────────────────
 // STYLES
@@ -509,17 +904,93 @@ function bx(x){return Object.assign({background:CD,border:"1px solid "+BR,border
 var INP={background:SF,border:"1px solid "+BR,borderRadius:9,color:TX,fontSize:13,padding:"9px 13px",fontFamily:FB,width:"100%",boxSizing:"border-box",outline:"none"};
 
 function Btn(props){
+  var isSubtle = props.v === "subtle";
   var bg=props.v==="pr"||!props.v?PR:props.v==="dn"?DN:props.v==="or"?OR:"rgba(255,255,255,0.08)";
-  return <div onClick={props.onClick} style={Object.assign({background:bg,color:props.v==="gh"?TX:"#000",border:props.v==="gh"?"1px solid "+BR:"none",borderRadius:10,fontFamily:FB,fontWeight:800,padding:props.lg?"13px 26px":props.sm?"6px 13px":"9px 18px",fontSize:props.lg?15:props.sm?12:13,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5},props.sx||{})}>{props.ch}</div>;
+  return <div onClick={props.onClick} style={Object.assign({background:bg,color:isSubtle?TX:"#000",border:isSubtle?"1px solid "+BR:"none",borderRadius:10,fontFamily:FB,fontWeight:800,padding:props.lg?"13px 26px":props.sm?"6px 13px":"9px 18px",fontSize:props.lg?15:props.sm?12:13,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5},props.sx||{})}>{props.ch}</div>;
 }
 function Lbl(props){return <p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:4}}>{props.t}</p>;}
 function Inp(props){return <input value={props.v} onChange={props.onChange} placeholder={props.ph} type={props.tp||"text"} style={Object.assign({},INP,props.sx||{})}/>;}
-function Txa(props){return <textarea value={props.v} onChange={props.onChange} placeholder={props.ph} style={Object.assign({},INP,{height:props.h||72,resize:"vertical"})}/>;}
+function Txa(props){return <textarea value={props.v} onChange={props.onChange} onClick={props.onClick} placeholder={props.ph} style={Object.assign({},INP,{height:props.h||72,resize:"vertical"})}/>;}
 
 function Modal(props){
   return(
     <div onClick={function(e){if(e.target===e.currentTarget)props.onClose();}} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
       <div style={{background:SF,border:"1px solid "+BR,borderRadius:20,width:"100%",maxWidth:props.w||480,maxHeight:"88vh",overflowY:"auto"}}>{props.children}</div>
+    </div>
+  );
+}
+
+function HeaderBell(props){
+  var unread = props.notifications.filter(function(note){ return !note.read; }).length;
+  var bellRef = useRef(null);
+
+  useEffect(function(){
+    if(!props.open) return;
+    function handleClick(event){
+      if(bellRef.current && !bellRef.current.contains(event.target)){
+        props.onClose();
+      }
+    }
+    window.addEventListener("mousedown", handleClick);
+    return function(){
+      window.removeEventListener("mousedown", handleClick);
+    };
+  },[props.open, props.onClose]);
+
+  return(
+    <div ref={bellRef} style={{position:"relative"}}>
+      <div onClick={props.onToggle} style={{width:38,height:38,borderRadius:11,border:"1px solid "+BR,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",background:props.open?PR+"18":SF,color:props.open?PR:TX,position:"relative"}}>
+        <FaBell />
+        {unread>0&&<span style={{position:"absolute",top:-4,right:-4,minWidth:18,height:18,borderRadius:999,background:OR,color:"#000",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 5px"}}>{unread}</span>}
+      </div>
+      {props.open&&<div style={{position:"absolute",right:0,top:46,width:320,background:SF,border:"1px solid "+BR,borderRadius:14,boxShadow:"0 18px 40px rgba(0,0,0,0.35)",overflow:"hidden",zIndex:50}}>
+        <div style={{padding:"12px 14px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <p style={{color:"#fff",fontWeight:800,fontSize:13}}>Notifications</p>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            {props.notifications.length>0&&<span onClick={props.onMarkRead} style={{color:PR,fontSize:11,fontWeight:700,cursor:"pointer"}}>Mark all read</span>}
+            <span onClick={props.onClose} style={{color:MU,fontSize:14,fontWeight:800,cursor:"pointer"}}>x</span>
+          </div>
+        </div>
+        <div style={{maxHeight:340,overflowY:"auto"}}>
+          {props.notifications.length===0&&<p style={{padding:18,color:MU,fontSize:12}}>No notifications yet.</p>}
+          {props.notifications.map(function(note){
+            return <div key={note.id} onClick={function(){props.onJump(note);}} style={{padding:"12px 14px",borderBottom:"1px solid "+BR,cursor:"pointer",background:note.read?"transparent":"rgba(0,200,150,0.06)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",gap:8,marginBottom:3}}>
+                <p style={{color:"#fff",fontSize:12,fontWeight:800}}>{note.title}</p>
+                <span style={{color:MU,fontSize:10,whiteSpace:"nowrap"}}>{formatShortDateTime(note.createdAt)}</span>
+              </div>
+              <p style={{color:MU,fontSize:11,lineHeight:1.5}}>{note.body}</p>
+            </div>;
+          })}
+        </div>
+      </div>}
+    </div>
+  );
+}
+
+function ApplicationMessages(props){
+  var [draft,setDraft]=useState("");
+  return(
+    <div onClick={function(e){e.stopPropagation();}} style={bx({background:BG,marginTop:10})}>
+      <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:8}}>
+        <FaCommentDots color={PR} />
+        <p style={{color:"#fff",fontWeight:800,fontSize:12}}>In-App Messages</p>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:7,maxHeight:180,overflowY:"auto",marginBottom:10}}>
+        {(props.messages || []).length===0&&<p style={{color:MU,fontSize:11}}>No messages yet. Keep all communication here for safety.</p>}
+        {(props.messages || []).map(function(message){
+          var mine = message.senderRole === props.role;
+          return <div key={message.id} style={{alignSelf:mine?"flex-end":"flex-start",maxWidth:"85%",background:mine?PR+"20":"rgba(255,255,255,0.05)",border:"1px solid "+(mine?PR+"44":BR),borderRadius:10,padding:"8px 10px"}}>
+            <p style={{color:mine?PR:"#fff",fontSize:10,fontWeight:800,marginBottom:2}}>{message.senderName}</p>
+            <p style={{color:"#D1D5DB",fontSize:12,lineHeight:1.5}}>{message.body}</p>
+            <p style={{color:MU,fontSize:10,marginTop:4}}>{formatShortDateTime(message.createdAt)}</p>
+          </div>;
+        })}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <Inp v={draft} onChange={function(e){setDraft(e.target.value);}} ph={props.placeholder||"Type a message..."} sx={{flex:1}}/>
+        <Btn ch={<><FaPaperPlane /> Send</>} sm onClick={function(e){ if(e&&e.stopPropagation)e.stopPropagation(); if(!draft.trim()) return; props.onSend(draft.trim()); setDraft(""); }}/>
+      </div>
     </div>
   );
 }
@@ -618,7 +1089,11 @@ export default function App(){
 
   function show(msg,t){setToast({msg,t:t||"ok"});setTimeout(function(){setToast(null);},3200);}
 
-  function handleLogin(u){setUser(u);setScreen(u.role);}
+  function handleLogin(u){
+    var nextRole = normalizeAppRole(u && u.role);
+    setUser(Object.assign({}, u, { role: nextRole }));
+    setScreen(nextRole);
+  }
   function handleLogout(){setUser(null);setScreen("login");if(sb)sb.auth.signOut();}
 
   // Check if already signed in on load
@@ -628,14 +1103,14 @@ export default function App(){
       if(res.data&&res.data.session){
         var uid=res.data.session.user.id;
         sb.from("profiles").select("role,first_name,last_name").eq("id",uid).maybeSingle().then(function(p){
-          if(!p.error && p.data) handleLogin({uid,role:p.data.role,name:p.data.first_name+" "+p.data.last_name});
+          if(!p.error && p.data) handleLogin({uid,role:normalizeAppRole(p.data.role),name:p.data.first_name+" "+p.data.last_name});
         });
       }
     });
   },[]);
 
   return(
-    <div style={{minHeight:"100vh",background:BG,fontFamily:FB,color:TX}}>
+    <div style={{minHeight:"100vh",background:"linear-gradient(180deg,#060A12 0%,#0A1120 100%)",fontFamily:FB,color:TX}}>
       <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet"/>
       <style>{`*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}.hov:hover{opacity:0.85}.jc{transition:all .15s;cursor:pointer}.jc:hover{background:#1A2540!important;transform:translateY(-1px)}.ni{transition:all .12s;cursor:pointer}.ni:hover{background:rgba(255,255,255,.07)!important}input,textarea,select{color-scheme:dark}textarea{resize:vertical;font-family:'Plus Jakarta Sans',sans-serif}`}</style>
       {screen==="login"   &&<LoginScreen onLogin={handleLogin} show={show}/>}
@@ -684,10 +1159,11 @@ function LoginScreen(props){
 
   async function handleBizAuth(){
     if(!email||!pw){props.show("Enter email and password","err");return;}
-    if(isNew&&(!businessForm.company||!businessForm.firstName||!businessForm.lastName||!businessForm.phone||!businessForm.address||!businessForm.industry||!businessForm.companySize||!businessForm.about)){props.show("Complete all required employer fields","err");return;}
+    if(isNew&&(!businessForm.company||!businessForm.firstName||!businessForm.lastName||!businessForm.phone||!businessForm.address||!businessForm.website||!businessForm.industry||!businessForm.companySize||!businessForm.about)){props.show("Complete all required employer fields","err");return;}
     setLoading(true);
+    var verificationMeta = getEmployerVerificationMetadata(email, businessForm.website, "pending");
     if(!sb){
-      props.onLogin({uid:"demo-biz",role:"business",name:businessForm.company||"Houndstooth Coffee",startNav:isNew?"profile":"overview",businessProfile:createBusinessProfile(Object.assign({},businessForm,{email:email}))});
+      props.onLogin({uid:"demo-biz",role:"business",name:businessForm.company||"Houndstooth Coffee",startNav:isNew?"profile":"overview",businessProfile:createBusinessProfile(Object.assign({},businessForm,{email:email,verificationStatus:verificationMeta.status,emailDomainMatch:verificationMeta.emailDomainMatch,verificationSignal:verificationMeta.verificationSignal}))});
       setLoading(false);return;
     }
     var res;
@@ -702,7 +1178,7 @@ function LoginScreen(props){
     }
     setLoading(false);
     if(res.error){props.show(res.error==="not_connected"?"Add your Supabase keys to connect":res.error,"err");return;}
-    props.onLogin({uid:res.uid,role:"business",name:businessForm.company||res.name,startNav:isNew?"profile":"overview",businessProfile:isNew?createBusinessProfile(Object.assign({},businessForm,{email:email})):null});
+    props.onLogin({uid:res.uid,role:"business",name:businessForm.company||res.name,startNav:isNew?"profile":"overview",businessProfile:isNew?createBusinessProfile(Object.assign({},businessForm,{email:email,verificationStatus:verificationMeta.status,emailDomainMatch:verificationMeta.emailDomainMatch,verificationSignal:verificationMeta.verificationSignal})):null});
   }
 
   return(
@@ -764,6 +1240,7 @@ function LoginScreen(props){
                 <div><Lbl t="PHONE"/><Inp v={businessForm.phone} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{phone:val});});}} ph="(214) 555-3377"/></div>
                 <div><Lbl t="ADDRESS"/><Inp v={businessForm.address} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{address:val});});}} ph="2817 Commerce St, Dallas TX"/></div>
                 <div><Lbl t="WEBSITE"/><Inp v={businessForm.website} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{website:val});});}} ph="houndstoothcoffee.com"/></div>
+                <p style={{color:MU,fontSize:11,marginTop:-5}}>Use your real business website. Matching your work email to this domain helps reviewers, but every employer still starts in Pending Verification until manually approved.</p>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
                   <div><Lbl t="INDUSTRY"/><Inp v={businessForm.industry} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{industry:val});});}} ph="Food and Beverage"/></div>
                   <div><Lbl t="COMPANY SIZE"/><Inp v={businessForm.companySize} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{companySize:val});});}} ph="11-50 employees"/></div>
@@ -788,8 +1265,8 @@ function LoginScreen(props){
 function StudentApp(props){
   var [nav,setNav]=useState(props.initialNav||"jobs");
   var [selJob,setSelJob]=useState(null);
-  var [jobs,setJobs]=useState(LOCAL_JOBS);
-  var [apps,setApps]=useState(LOCAL_APPS);
+  var [jobs,setJobs]=useState(applySharedJobs([], !sb));
+  var [apps,setApps]=useState([]);
   var [saved,setSaved]=useState([]);
   var [resume,setResume]=useState(null);
   var [rd,setRd]=useState(createResumeData(props.user&&props.user.studentProfile?props.user.studentProfile:{}));
@@ -812,11 +1289,21 @@ function StudentApp(props){
   var [nsk,setNsk]=useState("");
   var [npsk,setNpsk]=useState("");
   var [loading,setLoading]=useState(false);
+  var [bellOpen,setBellOpen]=useState(false);
+  var [walkthroughOpen,setWalkthroughOpen]=useState(false);
+  var [walkStep,setWalkStep]=useState(0);
+  var [sharedTick,setSharedTick]=useState(0);
   var fileRef=useRef();
+  var sharedState = readSharedState();
+  var notifications = (sharedState.notifications || []).filter(function(note){ return note.userId===props.user?.uid && note.role==="student"; });
 
   useEffect(function(){
     if(props.initialNav) setNav(props.initialNav);
   },[props.initialNav]);
+
+  useEffect(function(){
+    return bindSharedStateListener(function(){ setSharedTick(function(t){ return t+1; }); });
+  },[]);
 
   useEffect(function(){
     if(props.user&&props.user.studentProfile){
@@ -849,15 +1336,70 @@ function StudentApp(props){
     try{ localStorage.setItem(key, JSON.stringify(saved)); }catch{ void 0; }
   },[saved, props.user]);
 
+  useEffect(function(){
+    if(!props.user || sb) return;
+    setJobs(applySharedJobs([], true));
+    var mapped = getSharedApplicationsForStudent(props.user.uid).map(function(a){
+      return {id:a.id,jobId:a.jobId,status:a.status,applied:a.applied,note:a.note||"",iv:a.iv||null,ans:a.ans||{},messages:a.messages||[]};
+    });
+    setApps(mapped);
+  },[props.user, sharedTick]);
+
+  useEffect(function(){
+    if(!props.user) return;
+    var walkthroughKey = "launchdfw_onboarding_seen_" + props.user.uid;
+    if(!localStorage.getItem(walkthroughKey)) {
+      setWalkthroughOpen(true);
+      setWalkStep(0);
+    }
+  },[props.user]);
+
+  useEffect(function(){
+    if(!props.user || jobs.length===0 || saved.length===0) return;
+    saved.forEach(function(jobId){
+      var job = jobs.find(function(entry){ return entry.id===jobId; });
+      if(!job) return;
+      var days = getDaysUntil(job.deadline || getDefaultDeadline(job.id));
+      var flagKey = props.user.uid + "-" + job.id;
+      if(days <= 2 && days >= 0 && !sharedState.savedDeadlineAlerts[flagKey]){
+        addNotification({
+          userId: props.user.uid,
+          role: "student",
+          title: "Saved job closing soon",
+          body: (job.title || "A saved job") + " is expected to close in " + days + " day" + (days===1?"":"s") + ".",
+          nav: "saved",
+          jobId: job.id
+        });
+        updateSharedState(function(state){
+          state.savedDeadlineAlerts[flagKey] = true;
+          return state;
+        });
+      }
+    });
+  },[saved, jobs, props.user, sharedTick]);
+
   // Load real data from Supabase when connected
   useEffect(function(){
     if(!sb||!props.user)return;
-    dbLoadJobs().then(function(data){if(data&&data.length)setJobs(data.map(normalizeJob));});
+    dbLoadJobs().then(function(data){
+      if(Array.isArray(data)) setJobs(applySharedJobs(data.map(normalizeJob), false));
+    });
     dbLoadMyApps(props.user.uid).then(function(data){
-      if(!data)return;
+      if(!Array.isArray(data)){ setApps([]); return; }
       var mapped=data.map(function(a){
-        var iv=a.interviews&&a.interviews[0]?{date:a.interviews[0].interview_date,time:a.interviews[0].interview_time,loc:a.interviews[0].location,notes:a.interviews[0].notes}:null;
-        return {id:a.id,jobId:a.job_id,status:a.status,applied:new Date(a.applied_at).toLocaleDateString("en-US",{month:"short",day:"numeric"}),note:a.note||"",iv};
+        var sharedApp = getSharedApplicationById(a.id);
+        var dbIv=a.interviews&&a.interviews[0]?{date:a.interviews[0].interview_date,time:a.interviews[0].interview_time,loc:a.interviews[0].location,notes:a.interviews[0].notes}:null;
+        var iv=sharedApp&&sharedApp.iv?Object.assign({}, dbIv || {}, sharedApp.iv):dbIv;
+        return {
+          id:a.id,
+          jobId:a.job_id,
+          status:a.status,
+          applied:new Date(a.applied_at).toLocaleDateString("en-US",{month:"short",day:"numeric"}),
+          note:a.note||"",
+          iv,
+          ans:parseJsonObject(a.answers),
+          messages:(sharedApp && sharedApp.messages) || (Array.isArray(a.messages) ? a.messages : [])
+        };
       });
       setApps(mapped);
     });
@@ -900,9 +1442,55 @@ function StudentApp(props){
         }
       });
     });
-  },[props.user]);
+  },[props.user, sharedTick]);
 
   function hasApp(id){return apps.some(function(a){return a.jobId===id;});}
+
+  function syncStudentApplication(updatedApp) {
+    setApps(function(prev){
+      var exists = prev.some(function(entry){ return entry.id === updatedApp.id; });
+      if(!exists) return prev.concat([updatedApp]);
+      return prev.map(function(entry){ return entry.id === updatedApp.id ? Object.assign({}, entry, updatedApp) : entry; });
+    });
+  }
+
+  function sendMessage(appId, body) {
+    var job = jobs.find(function(entry){ return apps.find(function(app){ return app.id===appId && app.jobId===entry.id; }); });
+    var message = { id:"msg-" + Date.now(), senderRole:"student", senderName:buildFullName(prof.firstName, prof.lastName) || props.user.name, body:body, createdAt:new Date().toISOString() };
+    if(sb) dbAppendApplicationMessage(appId, message);
+    upsertSharedApplication(appId, function(app){
+      return Object.assign({}, app, { messages:(app.messages || []).concat([message]) });
+    });
+    syncStudentApplication({ id: appId, messages: ((apps.find(function(app){ return app.id === appId; }) || {}).messages || []).concat([message]) });
+    addNotification({
+      userId: (job && job.employerOwnerId) || "demo-biz",
+      role: "business",
+      title: "New student message",
+      body: (buildFullName(prof.firstName, prof.lastName) || "A student") + " sent a message about " + (job ? job.title : "an application") + ".",
+      nav: "applicants",
+      appId: appId
+    });
+    setSharedTick(function(t){ return t+1; });
+  }
+
+  function respondInterview(appId, response, responseNote) {
+    var appForInterview = apps.find(function(app){ return app.id===appId; });
+    var relatedJob = appForInterview ? jobs.find(function(job){ return job.id===appForInterview.jobId; }) : null;
+    upsertSharedApplication(appId, function(app){
+      return Object.assign({}, app, { iv: Object.assign({}, app.iv || {}, { status:response, responseNote:responseNote || "" }) });
+    });
+    syncStudentApplication({ id: appId, iv: Object.assign({}, (appForInterview && appForInterview.iv) || {}, { status:response, responseNote:responseNote || "" }) });
+    addNotification({
+      userId: (relatedJob && relatedJob.employerOwnerId) || "demo-biz",
+      role: "business",
+      title: "Interview response received",
+      body: (buildFullName(prof.firstName, prof.lastName) || "A student") + (response==="confirmed" ? " confirmed their interview." : " requested a different interview time."),
+      nav: "interviews",
+      appId: appId
+    });
+    setSharedTick(function(t){ return t+1; });
+    props.show(response==="confirmed" ? "Interview confirmed" : "Reschedule request sent","info");
+  }
 
   async function togSave(id){
     var key = props.user ? "launchdfw_saved_jobs_" + props.user.uid : "launchdfw_saved_jobs";
@@ -940,17 +1528,26 @@ function StudentApp(props){
   }
 
   var ivApps=apps.filter(function(a){return a.iv;});
-  var FLTS=["All","Part-Time","Internship","Seasonal","No Exp","16+","18+","College","STEM","Creative","Healthcare","Sports","Events","Outdoors"];
+  var FLTS=["All","Part-Time","Full-Time","Internship","Seasonal","No Exp","16+","18+","College","STEM","Creative","Healthcare","Sports","Events","Outdoors"];
+  var profileCompletion = getProfileCompletion(prof, rd, !!resume);
 
   var filteredJobs=jobs.filter(function(j){
     if(flt!=="All"&&j.type!==flt&&!(j.tags||[]).includes(flt))return false;
     if(q&&![j.title,j.co,j.loc].some(function(x){return x.toLowerCase().includes(q.toLowerCase());}))return false;
-    if(area.la&&calcMiles(area.la,area.lo,j.la,j.lo)>radius)return false;
+    if(area.la){
+      if(j.la == null || j.lo == null) return false;
+      if(calcMiles(area.la,area.lo,j.la,j.lo)>radius) return false;
+    }
     return true;
   });
+  var recommendedJobs = filteredJobs.slice().sort(function(a,b){ return scoreJobForStudent(b, prof, apps, area) - scoreJobForStudent(a, prof, apps, area); }).filter(function(job){ return !hasApp(job.id); }).slice(0,3);
 
   async function openApply(job){
     if(!resume){props.show("Upload resume first!","err");setNav("resume");setSelJob(null);return;}
+    if((job.tags || []).includes("18+") && parseInt(prof.age, 10) < 18){
+      props.show("This role is 18+ only, so you cannot apply yet.","err");
+      return;
+    }
     if(hasApp(job.id)){props.show("Already applied","info");return;}
     setApplyJob(job);setApplyStep(0);setAvail(["Sat","Sun"]);setAnote("");setAAns({});
   }
@@ -958,11 +1555,53 @@ function StudentApp(props){
   async function submitApp(){
     try {
       setLoading(true);
+      if((applyJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18){
+        props.show("This role is 18+ only, so you cannot apply yet.","err");
+        setLoading(false);
+        return;
+      }
+      var appId = "app-"+Date.now();
       if(sb&&props.user){
         var res=await dbSubmitApp(applyJob.id,props.user.uid,avail,anote,aAns);
         if(res.error){props.show("Could not submit: "+res.error,"err");setLoading(false);return;}
+        if(res.data && res.data.id) appId = res.data.id;
       }
-      setApps(function(p){return p.concat([{id:"local-"+Date.now(),jobId:applyJob.id,status:"pending",applied:"Today",note:"",iv:null}]);});
+      var newApp = {id:appId,jobId:applyJob.id,status:"pending",applied:"Today",note:anote||"",iv:null,ans:aAns,messages:[]};
+      updateSharedState(function(state){
+        state.applications = state.applications.concat([{
+          id:appId,
+          jobId:applyJob.id,
+          studentId:props.user.uid,
+          studentName:buildFullName(prof.firstName, prof.lastName) || props.user.name,
+          school:prof.school,
+          grade:prof.grade,
+          age:prof.age,
+          email:prof.email,
+          applied:"Today",
+          status:"pending",
+          note:anote || "",
+          ans:aAns,
+          iv:null,
+          messages:[],
+          resumeUrl:(resume && resume.url) || rd.resumeUrl || "",
+          resumeData:Object.assign({}, rd),
+          employerNotes:"",
+          starred:false,
+          flagged:false,
+          viewedAt:Date.now()
+        }]);
+        return state;
+      });
+      syncStudentApplication(newApp);
+      addNotification({
+        userId:applyJob.employerOwnerId || "demo-biz",
+        role:"business",
+        title:"New application received",
+        body:(buildFullName(prof.firstName, prof.lastName) || "A student") + " applied to " + applyJob.title + ".",
+        nav:"applicants",
+        appId:newApp.id,
+        jobId:applyJob.id
+      });
       setApplyJob(null);setSelJob(null);setLoading(false);
       props.show("Application submitted! Success");
     } catch (e) {
@@ -1014,9 +1653,17 @@ function StudentApp(props){
             <h1 style={{fontFamily:FH,fontSize:17,fontWeight:800,color:"#fff"}}>
               {navTitles[nav]}
             </h1>
-            <p style={{color:MU,fontSize:11}}>Dallas Metroplex - Spring 2026{props.user&&sb?" - Signed in as "+props.user.name:""}</p>
+              <p style={{color:MU,fontSize:11}}>Live business-posted jobs only{props.user&&sb?" - Signed in as "+props.user.name:""}</p>
           </div>
           <div style={{display:"flex",gap:9,alignItems:"center"}}>
+            <HeaderBell
+              open={bellOpen}
+              onToggle={function(){setBellOpen(!bellOpen);}}
+              onClose={function(){setBellOpen(false);}}
+              notifications={notifications}
+              onMarkRead={function(){markNotificationsRead(props.user.uid,"student");setSharedTick(function(t){return t+1;});}}
+              onJump={function(note){setBellOpen(false);if(note.nav) setNav(note.nav); if(note.jobId){ var job = jobs.find(function(entry){ return entry.id===note.jobId; }); if(job) setSelJob(job); }}}
+            />
             {!resume?<span style={pill(WN)}><FaExclamationTriangle /> Upload resume to apply</span>:<span style={pill(PR)}><FaCheck /> Resume ready</span>}
           </div>
         </div>
@@ -1024,7 +1671,7 @@ function StudentApp(props){
         <div style={{flex:1,overflowY:"auto",padding:"20px 22px",display:"flex",gap:0}}>
           <div style={{flex:1,minWidth:0}}>
 
-            {nav==="jobs"&&<StudentJobsPage jobs={filteredJobs} allJobs={jobs} flt={flt} setFlt={setFlt} q={q} setQ={setQ} area={area} setArea={setArea} radius={radius} setRadius={setRadius} setSelJob={setSelJob} saved={saved} togSave={togSave} hasApp={hasApp} FLTS={FLTS}/>}
+            {nav==="jobs"&&<StudentJobsPage jobs={filteredJobs} recommendedJobs={recommendedJobs} profile={prof} allJobs={jobs} flt={flt} setFlt={setFlt} q={q} setQ={setQ} area={area} setArea={setArea} radius={radius} setRadius={setRadius} setSelJob={function(job){setSelJob(job); updateSharedState(function(state){ state.jobViews[job.id] = (state.jobViews[job.id] || 0) + 1; return state; }); }} saved={saved} togSave={togSave} hasApp={hasApp} FLTS={FLTS}/>}
 
             {nav==="saved"&&(
               saved.length===0
@@ -1034,9 +1681,9 @@ function StudentApp(props){
 
             {nav==="resume"&&<StudentResumePage resume={resume} setResume={setResume} rd={rd} setRd={setRd} tmpl={tmpl} setTmpl={setTmpl} tab={resTab} setTab={setResTab} show={props.show} fileRef={fileRef} nsk={nsk} setNsk={setNsk} user={props.user}/>}
 
-            {nav==="apps"&&<AppsView apps={apps} jobs={jobs} setNav={setNav}/>}
+            {nav==="apps"&&<AppsView apps={apps} jobs={jobs} setNav={setNav} role="student" onSendMessage={sendMessage}/>}
 
-            {nav==="ivs"&&<StudentIVView apps={apps} jobs={jobs}/>}
+            {nav==="ivs"&&<StudentIVView apps={apps} jobs={jobs} onRespondInterview={respondInterview}/>}
 
             {nav==="tools"&&<ToolsView tab={rTab} setTab={setRTab} oq={oqIdx} setOq={setOqIdx}/>}
 
@@ -1050,7 +1697,7 @@ function StudentApp(props){
                     <p style={{color:MU,fontSize:12,marginTop:2}}>{prof.bio}</p>
                   </div>
                   <div style={{display:"flex",gap:14,flexShrink:0}}>{[{n:apps.length,icon:<FaEnvelope />,label:"Applied"},{n:apps.filter(function(a){return a.status==="accepted";}).length,icon:<FaCheck />,label:"Accepted"},{n:saved.length,icon:<FaHeart />,label:"Saved"}].map(function(s){return <div key={s.label} style={{textAlign:"center"}}><p style={{fontFamily:FH,fontSize:18,fontWeight:800,color:PR}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.icon} {s.label}</p></div>;})}</div>
-                  <Btn ch={editP?"Cancel":"Edit Profile"} v={editP?"gh":"pr"} onClick={function(){setPd(Object.assign({},prof));setEditP(!editP);}}/>
+                  <Btn ch={editP?"Cancel":"Edit Profile"} v={editP?"subtle":"pr"} onClick={function(){setPd(Object.assign({},prof));setEditP(!editP);}}/>
                 </div>
                 {editP?(
                   <div style={bx()}>
@@ -1065,12 +1712,12 @@ function StudentApp(props){
                       <p style={{color:MU,fontSize:11,marginBottom:6}}>Click to add popular skills:</p>
                       <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{PRESET_SKILLS.filter(function(sk){return !pd.skills.includes(sk);}).map(function(sk){return <span key={sk} className="ni" onClick={function(){setPd(function(p){return Object.assign({},p,{skills:p.skills.concat([sk])});});}} style={{background:"rgba(255,255,255,0.05)",border:"1px solid "+BR,borderRadius:7,padding:"3px 9px",fontSize:11,color:MU,cursor:"pointer"}}>+ {sk}</span>;})}</div>
                     </div>
-                    <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg onClick={saveProfile}/><Btn ch="Cancel" v="gh" onClick={function(){setEditP(false);}}/></div>
+                    <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg onClick={saveProfile}/><Btn ch="Cancel" v="subtle" onClick={function(){setEditP(false);}}/></div>
                   </div>
                 ):(
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:13}}>
                     <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Contact Info</h3>{[["Email",prof.email],["Phone",prof.phone],["School",prof.school],["Grade",prof.grade],["Age",prof.age]].map(function(pair){return <div key={pair[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:10,fontWeight:700}}>{pair[0]}</p><p style={{color:"#fff",fontSize:12,fontWeight:600}}>{pair[1]}</p></div>;})}</div>
-                    <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Skills</h3><div style={{display:"flex",flexWrap:"wrap",gap:6}}>{prof.skills.map(function(sk){return <span key={sk} style={pill(PR)}>{sk}</span>;})}</div></div>
+                    <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Profile Strength</h3><div style={{marginBottom:8}}><div style={{height:10,borderRadius:999,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}><div style={{width:profileCompletion.percent+"%",height:"100%",background:"linear-gradient(90deg,"+PR+","+OR+")"}}/></div><p style={{color:PR,fontSize:12,fontWeight:800,marginTop:7}}>{profileCompletion.percent}% complete</p></div><div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>{prof.skills.map(function(sk){return <span key={sk} style={pill(PR)}>{sk}</span>;})}</div>{profileCompletion.missing.length>0?<div><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:6}}>Still missing:</p><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{profileCompletion.missing.map(function(item){return <span key={item} style={pill(WN,"rgba(245,158,11,0.08)")}>{item}</span>;})}</div></div>:<p style={{color:"#6EE7B7",fontSize:12,fontWeight:700}}><FaCheckCircle /> Your profile is application-ready.</p>}</div>
                   </div>
                 )}
               </div>
@@ -1082,7 +1729,7 @@ function StudentApp(props){
               <div style={{background:SF,border:"1px solid "+BR,borderRadius:18,overflow:"hidden",position:"sticky",top:0,maxHeight:"calc(100vh - 100px)",overflowY:"auto"}}>
                 <div style={{background:selJob.clr+"22",padding:"14px 16px 12px",borderBottom:"1px solid "+BR}}>
                   <div style={{display:"flex",justifyContent:"space-between",marginBottom:11}}>
-                    <Btn ch="Close" v="gh" sm onClick={function(){setSelJob(null);}}/>
+                    <Btn ch="Close" v="subtle" sm onClick={function(){setSelJob(null);}}/>
                     <span className="hov" onClick={function(){togSave(selJob.id);}} style={{fontSize:18,cursor:"pointer"}}>{saved.includes(selJob.id)?<FaHeart color="#ff0000" />:<FaHeart />}</span>
                   </div>
                   <div style={{display:"flex",gap:11,alignItems:"center"}}>
@@ -1090,6 +1737,7 @@ function StudentApp(props){
                     <div>
                       <h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff",marginBottom:2}}>{selJob.title}</h2>
                       <p style={{color:MU,fontSize:12}}>{selJob.co||selJob.company_name||selJob.company||"Employer"} - {selJob.loc||selJob.location||"Location TBD"}</p>
+                      <p style={{color:getVerificationBadge(selJob.verificationStatus).color,fontSize:11,marginTop:3,fontWeight:800}}>{getVerificationBadge(selJob.verificationStatus).text}</p>
                       {area.la&&<p style={{color:PR,fontSize:11,marginTop:2}}><FaMapMarker /> {calcMiles(area.la,area.lo,selJob.la,selJob.lo)} miles away</p>}
                     </div>
                   </div>
@@ -1110,11 +1758,13 @@ function StudentApp(props){
                       {selJob.qs.map(function(q2,i){return <p key={i} style={{color:"#BAE6FD",fontSize:12,marginBottom:3}}>- {q2}</p>;})}
                     </div>
                   )}
+                  {getSkillGap(prof.skills, selJob).wanted.length>0&&<div style={{background:"rgba(255,255,255,0.03)",border:"1px solid "+BR,borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:"#fff",fontSize:11,fontWeight:800,marginBottom:6}}>Skills Gap</p><div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:7}}>{getSkillGap(prof.skills, selJob).matched.map(function(skill){return <span key={skill} style={pill(PR)}>{skill}</span>;})}{getSkillGap(prof.skills, selJob).missing.map(function(skill){return <span key={skill} style={pill(WN,"rgba(245,158,11,0.08)")}>Add {skill}</span>;})}</div><p style={{color:MU,fontSize:11}}>Adding the highlighted skills to your profile or resume can make you a stronger fit.</p></div>}
                   <div style={{background:"rgba(0,200,150,0.07)",border:"1px solid "+PR+"33",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:PR,fontSize:11,fontWeight:800,marginBottom:2}}><FaLock /> Safe Communication</p><p style={{color:"#6EE7B7",fontSize:11}}>All messages stay in-app. Contact info is never shared.</p></div>
+                  {(selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18 && <div style={{background:"rgba(239,68,68,0.08)",border:"1px solid "+DN+"44",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:DN,fontSize:12,fontWeight:800}}>Age verification gate</p><p style={{color:"#FCA5A5",fontSize:11}}>This listing requires applicants to be 18 or older based on the age in your profile.</p></div>}
                   {!resume&&<div style={{background:"rgba(245,158,11,0.08)",border:"1px solid "+WN+"44",borderRadius:9,padding:"10px 12px",marginBottom:10}}><p style={{color:WN,fontSize:12,fontWeight:800}}>Warning: Upload resume to apply</p></div>}
                   {hasApp(selJob.id)
                     ?<div style={{background:"rgba(0,200,150,0.1)",border:"1px solid "+PR+"44",borderRadius:11,padding:13,textAlign:"center"}}><p style={{fontSize:24,marginBottom:4}}><FaCheck size={24} /></p><p style={{color:PR,fontWeight:800,fontSize:13}}>Already Applied! Check Applications.</p></div>
-                    :<Btn ch={resume?"Apply Now":"Upload Resume First"} lg sx={{width:"100%",justifyContent:"center"}} onClick={function(){openApply(selJob);}}/>
+                    :<Btn ch={resume?(((selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18)?"18+ Required":"Apply Now"):"Upload Resume First"} lg sx={{width:"100%",justifyContent:"center",opacity:((selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18)?0.7:1}} onClick={function(){openApply(selJob);}}/>
                   }
                 </div>
               </div>
@@ -1127,7 +1777,7 @@ function StudentApp(props){
         <Modal onClose={function(){setApplyJob(null);}}>
           <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div><p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:2}}>APPLYING TO {applyCompany.toUpperCase()}</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{applyJob.title}</h2></div>
-            <Btn ch="X" v="gh" sm onClick={function(){setApplyJob(null);}}/>
+            <Btn ch="X" v="subtle" sm onClick={function(){setApplyJob(null);}}/>
           </div>
           <div style={{padding:"12px 18px 18px"}}>
             <div style={{display:"flex",gap:4,marginBottom:14}}>{steps.map(function(s,i){return <div key={s} style={{flex:1,textAlign:"center"}}><div style={{width:20,height:20,borderRadius:"50%",background:i<=applyStep?PR:"rgba(255,255,255,0.1)",color:i<=applyStep?"#000":MU,fontSize:9,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 3px"}}>{i+1}</div><p style={{color:i===applyStep?PR:MU,fontSize:9,fontWeight:700}}>{s}</p></div>;})}
@@ -1143,6 +1793,20 @@ function StudentApp(props){
           </div>
         </Modal>
       )}
+
+      {walkthroughOpen&&<Modal onClose={function(){setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}>
+        <div style={{padding:"16px 18px",borderBottom:"1px solid "+BR}}>
+          <p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:3}}>GETTING STARTED</p>
+          <h2 style={{fontFamily:FH,fontSize:16,fontWeight:800,color:"#fff"}}>Your first steps on LaunchDFW</h2>
+        </div>
+        <div style={{padding:"18px"}}>
+          {[{title:"Upload or build your resume",copy:"Employers can only review you once your resume is ready.",nav:"resume"},{title:"Finish your profile",copy:"Add your age, bio, and skills so recommendations and safety checks work.",nav:"profile"},{title:"Apply and watch messages",copy:"After your first application, keep all conversation inside the app.",nav:"jobs"}].map(function(step,i){return <div key={step.title} style={{display:"flex",gap:10,marginBottom:12,opacity:i===walkStep?1:0.55}}><div style={{width:28,height:28,borderRadius:8,background:(i<=walkStep?PR:BR),display:"flex",alignItems:"center",justifyContent:"center",color:i<=walkStep?"#000":MU,fontWeight:800,fontSize:12,flexShrink:0}}>{i+1}</div><div><p style={{color:"#fff",fontWeight:800,fontSize:13,marginBottom:2}}>{step.title}</p><p style={{color:MU,fontSize:12,lineHeight:1.6}}>{step.copy}</p></div></div>;})}
+          <div style={{display:"flex",gap:8,marginTop:16}}>
+            {walkStep<2?<Btn ch="Next Tip" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkStep(function(s){return s+1;});}}/>:<Btn ch="Finish Walkthrough" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}/>}
+            <Btn ch="Take Me There" v="subtle" onClick={function(){var nextNav=["resume","profile","jobs"][walkStep];setNav(nextNav);setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}/>
+          </div>
+        </div>
+      </Modal>}
     </div>
   );
 }
@@ -1151,13 +1815,22 @@ function StudentJobsPage(props){
   return(
     <div>
       <div style={{background:"linear-gradient(135deg,#0A1628,#0D1F3C)",border:"1px solid rgba(0,200,150,0.2)",borderRadius:16,padding:"16px 20px",marginBottom:14}}>
-        <p style={{color:PR,fontSize:10,fontWeight:800,letterSpacing:2,marginBottom:3}}><FaMapMarker /> DALLAS METROPLEX - VERIFIED EMPLOYERS ONLY</p>
-        <h2 style={{fontFamily:FH,fontSize:19,fontWeight:800,color:"#fff",marginBottom:4}}>{props.allJobs.length} Student Opportunities in DFW</h2>
-        <p style={{color:MU,fontSize:12,marginBottom:10}}>Safe - Age-Appropriate - No Network Needed</p>
+        <p style={{color:PR,fontSize:10,fontWeight:800,letterSpacing:2,marginBottom:3}}><FaMapMarker /> LIVE BUSINESS JOB BOARD</p>
+        <h2 style={{fontFamily:FH,fontSize:19,fontWeight:800,color:"#fff",marginBottom:4}}>{props.allJobs.length} Live Student Opportunities</h2>
+        <p style={{color:MU,fontSize:12,marginBottom:10}}>Only jobs created by businesses appear here. No seeded or fake listings.</p>
         <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
-          {[{n:props.allJobs.filter(function(j){return j.posted==="Today";}).length,l:"New Today"},{n:"100%",l:"Verified"},{n:"$11-20/hr",l:"Pay Range"},{n:props.allJobs.length,l:"Total Jobs"}].map(function(s){return <div key={s.l} style={{textAlign:"center"}}><p style={{fontFamily:FH,fontSize:18,fontWeight:800,color:PR}}>{s.n}</p><p style={{color:MU,fontSize:10}}>{s.l}</p></div>;})}
+          {[{n:props.allJobs.filter(function(j){return j.posted==="Today";}).length,l:"Posted Today"},{n:props.allJobs.filter(function(j){return (j.spots||0) > 0;}).length,l:"Open Listings"},{n:props.allJobs.reduce(function(total, job){ return total + (parseInt(job.spots, 10) || 0); }, 0),l:"Total Spots"},{n:props.allJobs.length,l:"Total Jobs"}].map(function(s){return <div key={s.l} style={{textAlign:"center"}}><p style={{fontFamily:FH,fontSize:18,fontWeight:800,color:PR}}>{s.n}</p><p style={{color:MU,fontSize:10}}>{s.l}</p></div>;})}
         </div>
       </div>
+      {props.recommendedJobs && props.recommendedJobs.length>0&&<div style={bx({marginBottom:14,borderColor:PR+"33"})}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+          <div><p style={{color:PR,fontSize:11,fontWeight:800,letterSpacing:1}}>RECOMMENDED FOR YOU</p><p style={{color:MU,fontSize:12}}>Based on your skills, age, location, and application history.</p></div>
+          <span style={pill(PR)}>{props.profile.skills.length} skills on profile</span>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))",gap:10}}>
+          {props.recommendedJobs.map(function(job){return <JobCard key={"rec-"+job.id} job={job} area={props.area} onClick={function(){props.setSelJob(job);}} saved={props.saved.includes(job.id)} togSave={props.togSave} applied={props.hasApp(job.id)} />;})}
+        </div>
+      </div>}
       <div style={bx({marginBottom:14,borderColor:PR+"33"})}>
         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><span style={{color:PR,fontWeight:800,fontSize:13}}><FaMapMarker /> Filter by Distance</span>{props.area.la&&<span style={pill(PR)}>Active</span>}</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 200px",gap:12,alignItems:"end"}}>
@@ -1177,7 +1850,7 @@ function StudentJobsPage(props){
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:11}}>
         {props.jobs.map(function(j){return <JobCard key={j.id} job={j} saved={props.saved.includes(j.id)} togSave={props.togSave} onClick={function(){props.setSelJob(j);}} applied={props.hasApp(j.id)} area={props.area}/>;}) }
       </div>
-      {props.jobs.length===0&&<p style={{color:MU,textAlign:"center",padding:"40px 0"}}>No jobs match. Try adjusting filters or radius.</p>}
+      {props.jobs.length===0&&<p style={{color:MU,textAlign:"center",padding:"40px 0"}}>{props.allJobs.length===0?"No live jobs yet. Businesses need to post listings before students can apply.":"No jobs match. Try adjusting filters or radius."}</p>}
     </div>
   );
 }
@@ -1198,6 +1871,7 @@ function JobCard(props){
       <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
         <span style={pill(job.clr)}>{job.type}</span>
         <span style={pill("#10B981")}>{job.pay}</span>
+        <span style={pill(getVerificationBadge(job.verificationStatus).color, getVerificationBadge(job.verificationStatus).bg)}>{getVerificationBadge(job.verificationStatus).text}</span>
         {props.applied&&<span style={Object.assign({},pill(PR),{fontSize:10})}><FaCheck /> Applied</span>}
         {job.posted==="Today"&&<span style={Object.assign({},pill(OR),{fontSize:10})}><FaStar /> New</span>}
       </div>
@@ -1212,6 +1886,7 @@ function JobCard(props){
 
 function AppsView(props){
   var sc={accepted:{c:"#10B981",l:"Accepted!",bg:"rgba(16,185,129,0.08)"},pending:{c:WN,l:"Under Review",bg:"rgba(245,158,11,0.08)"},declined:{c:DN,l:"Not Selected",bg:"rgba(239,68,68,0.08)"}};
+  var [openApp,setOpenApp]=useState(null);
   return(
     <div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:11,marginBottom:18}}>
@@ -1221,18 +1896,20 @@ function AppsView(props){
       :<div style={{display:"flex",flexDirection:"column",gap:11}}>{props.apps.map(function(app){
         var job=props.jobs.find(function(j){return j.id===app.jobId;});if(!job)return null;
         var s=sc[app.status];
+        var isOpen = openApp === app.id;
         return <div key={app.id||app.jobId} style={bx({border:"1px solid "+s.c+"33"})}>
           <div style={{display:"flex",gap:12}}>
             <div style={{width:44,height:44,borderRadius:11,background:job.clr+"22",border:"1px solid "+job.clr+"44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{job.logo}</div>
             <div style={{flex:1}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}}>
                 <div><p style={{color:"#fff",fontWeight:800,fontSize:14,fontFamily:FH}}>{job.title}</p><p style={{color:MU,fontSize:12}}>{job.co} - Applied {app.applied}</p></div>
-                <div style={{background:s.bg,border:"1px solid "+s.c+"44",borderRadius:9,padding:"7px 12px",textAlign:"center",minWidth:110}}><p style={{color:s.c,fontSize:12,fontWeight:800}}>{s.l}</p></div>
+                <div style={{display:"flex",gap:7,alignItems:"center",flexWrap:"wrap"}}><div style={{background:s.bg,border:"1px solid "+s.c+"44",borderRadius:9,padding:"7px 12px",textAlign:"center",minWidth:110}}><p style={{color:s.c,fontSize:12,fontWeight:800}}>{s.l}</p></div><Btn ch={isOpen?"Hide Messages":"Messages"} v="gh" sm onClick={function(){setOpenApp(isOpen?null:app.id);}}/></div>
               </div>
               {app.status==="accepted"&&app.iv&&<div style={{marginTop:9,background:"rgba(0,200,150,0.07)",border:"1px solid "+PR+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:PR,fontWeight:800,fontSize:12,marginBottom:2}}><FaCalendar /> Interview Scheduled!</p><p style={{color:"#6EE7B7",fontSize:12}}>{app.iv.date} at {app.iv.time} - {app.iv.loc}</p></div>}
               {app.status==="accepted"&&!app.iv&&<div style={{marginTop:9,background:"rgba(16,185,129,0.07)",border:"1px solid #10B98133",borderRadius:9,padding:"9px 11px"}}><p style={{color:"#10B981",fontSize:12,fontWeight:800}}><FaCheck /> Accepted! {app.note}</p></div>}
               {app.status==="declined"&&<div style={{marginTop:9,background:"rgba(239,68,68,0.06)",border:"1px solid #EF444433",borderRadius:9,padding:"9px 11px"}}><p style={{color:DN,fontSize:12,fontWeight:800}}>Keep going - most students apply to 5+ jobs. {app.note}</p></div>}
               {app.status==="pending"&&<div style={{marginTop:9,background:"rgba(245,158,11,0.06)",border:"1px solid #F59E0B33",borderRadius:9,padding:"9px 11px"}}><p style={{color:WN,fontSize:12,fontWeight:800}}><FaHourglassHalf /> Under review - typically 3 to 5 business days</p></div>}
+              {isOpen&&<ApplicationMessages role={props.role} messages={app.messages||[]} onSend={function(body){props.onSendMessage(app.id, body);}} placeholder="Message this employer safely..." />}
             </div>
           </div>
         </div>;
@@ -1242,6 +1919,7 @@ function AppsView(props){
 }
 
 function StudentIVView(props){
+  var [requestNote,setRequestNote]=useState({});
   var ivApps=props.apps.filter(function(a){return a.iv;});
   if(ivApps.length===0)return <div style={bx({textAlign:"center",padding:40})}><p style={{fontSize:36,marginBottom:12}}><FaCalendar size={36} /></p><p style={{color:"#fff",fontWeight:700,marginBottom:6}}>No interviews scheduled yet</p><p style={{color:MU,fontSize:13}}>Once an employer schedules an interview it will appear here.</p></div>;
   return(
@@ -1259,6 +1937,17 @@ function StudentIVView(props){
                 {[[<FaCalendar size={16} />,"Date",iv.date],[<FaClock size={16} />,"Time",iv.time],[<FaMapMarker size={16} />,"Location",iv.loc]].map(function(row){return <div key={row[1]} style={{background:BG,borderRadius:9,padding:"9px 11px",border:"1px solid "+BR}}><p style={{fontSize:16,marginBottom:3}}>{row[0]}</p><p style={{color:MU,fontSize:9,fontWeight:700,letterSpacing:1,marginBottom:1}}>{row[1].toUpperCase()}</p><p style={{color:"#fff",fontSize:11,fontWeight:700}}>{row[2]}</p></div>;}) }
               </div>
               {iv.notes&&<div style={{background:PR+"0A",border:"1px solid "+PR+"22",borderRadius:9,padding:"9px 11px",marginBottom:9}}><p style={{color:PR,fontSize:11,fontWeight:800,marginBottom:3}}><FaStickyNote /> From Employer</p><p style={{color:"#D1FAE5",fontSize:12,lineHeight:1.6}}>{iv.notes}</p></div>}
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:9}}>
+                <span style={pill(iv.status==="confirmed"?PR:iv.status==="requested_new_time"?WN:BL)}>{iv.status==="confirmed"?"Confirmed":iv.status==="requested_new_time"?"Reschedule Requested":"Awaiting Your Response"}</span>
+                {iv.responseNote&&<span style={pill(WN,"rgba(245,158,11,0.08)")}>{iv.responseNote}</span>}
+              </div>
+              {iv.status!=="confirmed"&&<div style={{marginBottom:10}}>
+                <div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+                  <Btn ch="Confirm Time" sm onClick={function(){props.onRespondInterview(app.id,"confirmed","Student confirmed");}}/>
+                  <Btn ch="Request Different Time" v="gh" sm onClick={function(){props.onRespondInterview(app.id,"requested_new_time",requestNote[app.id]||"Please suggest another time.");}}/>
+                </div>
+                <Inp v={requestNote[app.id]||""} onChange={function(e){var val=e.target.value;setRequestNote(function(p){return Object.assign({},p,{[app.id]:val});});}} ph="Optional note if you need a different time..." />
+              </div>}
               <div style={{background:"rgba(245,158,11,0.07)",border:"1px solid "+WN+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:WN,fontSize:12,lineHeight:1.6}}><FaLightbulb /> Tip: Research the company, dress professionally, bring your resume, and arrive 10 min early.</p></div>
             </div>
           </div>
@@ -1285,31 +1974,44 @@ function ToolsView(props){
 
 function StudentResumePage(props){
   function addSkill(){if(props.nsk.trim()&&!props.rd.skills.includes(props.nsk.trim())){props.setRd(function(p){return Object.assign({},p,{skills:p.skills.concat([props.nsk.trim()])});});props.setNsk("");}}
+  function downloadResumePdf(){
+    var blob = buildResumePdfBlob(props.rd);
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = (props.rd.firstName || "student") + "_" + (props.rd.lastName || "resume") + ".pdf";
+    link.click();
+    URL.revokeObjectURL(url);
+    props.show("PDF downloaded!","info");
+  }
   async function handleUpload(e){
     var f=e.target.files[0];if(!f)return;
     if(!f.type.includes("pdf")&&!f.name.endsWith(".docx")){props.show("PDF or Word only","err");return;}
+    var uploadUrl = "";
     if(sb&&props.user){
       var res=await dbUploadResume(props.user.uid,f);
       if(res.error){props.show("Upload failed: "+res.error,"err");return;}
       // Save the resume URL to database
       const updateRes = await sb.from("students").update({ resume_url: res.url }).eq("id", props.user.uid);
       if(updateRes.error){props.show("Failed to save resume URL: "+updateRes.error.message,"err");return;}
+      uploadUrl = res.url;
     }
-    props.setResume({name:f.name,size:(f.size/1024).toFixed(0)+"KB", url: res?.url});
+    props.setResume({name:f.name,size:(f.size/1024).toFixed(0)+"KB", url: uploadUrl});
+    props.setRd(function(prev){return Object.assign({}, prev, { resumeUrl: uploadUrl || prev.resumeUrl || "" });});
     props.show("Resume uploaded! Success");
   }
   return(
     <div>
       <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
-        {[{id:"upload",l:<><FaUpload /> Upload</>},{id:"builder",l:<><FaWrench /> Resume Builder</>},{id:"templates",l:<><FaPalette /> Templates</>},{id:"example",l:<><FaFileAlt /> Example</>}].map(function(t){return <Btn key={t.id} ch={t.l} v={props.tab===t.id?"pr":"gh"} onClick={function(){props.setTab(t.id);}}/>;}) }
+        {[{id:"upload",l:<><FaUpload /> Upload</>},{id:"builder",l:<><FaWrench /> Resume Builder</>},{id:"templates",l:<><FaPalette /> Templates</>},{id:"example",l:<><FaFileAlt /> Example</>}].map(function(t){return <Btn key={t.id} ch={t.l} v={props.tab===t.id?"pr":"subtle"} onClick={function(){props.setTab(t.id);}}/>;}) }
       </div>
       {props.tab==="upload"&&<div style={{maxWidth:480}}>
         <div className="hov" onClick={function(){props.fileRef.current.click();}} style={{border:"2px dashed "+(props.resume?PR:BR),borderRadius:16,padding:"28px 22px",textAlign:"center",background:props.resume?"rgba(0,200,150,0.05)":CD,marginBottom:14,cursor:"pointer"}}>
           <input ref={props.fileRef} type="file" accept=".pdf,.docx" onChange={handleUpload} style={{display:"none"}}/>
           {props.resume?<div><p style={{fontSize:32,marginBottom:8}}><FaCheck /></p><p style={{color:PR,fontSize:14,fontWeight:800}}>{props.resume.name}</p><p style={{color:MU,fontSize:12}}>{props.resume.size} - Click to replace</p></div>:<div><p style={{fontSize:32,marginBottom:8}}><FaUpload /></p><p style={{color:"#fff",fontSize:14,fontWeight:800,marginBottom:3}}>Upload Your Resume</p><p style={{color:MU,fontSize:12}}>PDF or Word (.docx)</p></div>}
         </div>
-        {!props.resume&&<div style={bx({textAlign:"center"})}><p style={{color:MU,fontSize:13,marginBottom:11}}>Do not have one yet?</p><div style={{display:"flex",gap:9,justifyContent:"center"}}><Btn ch="Build One" onClick={function(){props.setTab("builder");}}/><Btn ch="See Example" v="gh" onClick={function(){props.setTab("example");}}/></div></div>}
-        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><div style={{display:"flex",gap:8}}><Btn ch="View Resume" v="gh" sm onClick={function(){window.open(props.resume.url,'_blank');}}/><Btn ch="Remove" v="gh" sm onClick={async function(){props.setResume(null);if(sb&&props.user){const res=await sb.from("students").update({resume_url:null}).eq("id",props.user.uid);if(res.error)props.show("Failed to remove: "+res.error.message,"err");else props.show("Removed","info");}else props.show("Removed","info");}}/></div></div>}
+        {!props.resume&&<div style={bx({textAlign:"center"})}><p style={{color:MU,fontSize:13,marginBottom:11}}>Do not have one yet?</p><div style={{display:"flex",gap:9,justifyContent:"center"}}><Btn ch="Build One" onClick={function(){props.setTab("builder");}}/><Btn ch="See Example" v="subtle" onClick={function(){props.setTab("example");}}/></div></div>}
+        {props.resume&&<div style={bx({display:"flex",justifyContent:"space-between",alignItems:"center"})}><p style={{color:PR,fontWeight:800}}>Resume on file - ready to apply!</p><div style={{display:"flex",gap:8}}><Btn ch="View Resume" v="subtle" sm onClick={function(){if(props.resume.url)window.open(props.resume.url,'_blank');}}/><Btn ch="Remove" v="subtle" sm onClick={async function(){props.setResume(null);props.setRd(function(prev){return Object.assign({}, prev, { resumeUrl: "" });});if(sb&&props.user){const res=await sb.from("students").update({resume_url:null}).eq("id",props.user.uid);if(res.error)props.show("Failed to remove: "+res.error.message,"err");else props.show("Removed","info");}else props.show("Removed","info");}}/></div></div>}
       </div>}
       {props.tab==="templates"&&<div style={{maxWidth:600}}>
         <p style={{color:MU,fontSize:13,marginBottom:14}}>Pick a style, then customize in Builder.</p>
@@ -1346,18 +2048,21 @@ function StudentResumePage(props){
               <input value={ex.dates} onChange={function(e){var val=e.target.value;props.setRd(function(p){var a=p.experience.slice();a[i]=Object.assign({},a[i],{dates:val});return Object.assign({},p,{experience:a});});}} placeholder="Dates" style={Object.assign({},INP,{fontSize:12,padding:"7px 10px",marginBottom:6})}/>
               <textarea value={ex.desc} onChange={function(e){var val=e.target.value;props.setRd(function(p){var a=p.experience.slice();a[i]=Object.assign({},a[i],{desc:val});return Object.assign({},p,{experience:a});});}} placeholder="Describe your role..." style={Object.assign({},INP,{height:46,fontSize:12,padding:"7px 10px"})}/>
             </div>;})}
-            <Btn ch="+ Add Experience" v="gh" sm onClick={function(){props.setRd(function(p){return Object.assign({},p,{experience:p.experience.concat([{role:"",org:"",dates:"",desc:""}])});});}}/>
+            <Btn ch="+ Add Experience" v="subtle" sm onClick={function(){props.setRd(function(p){return Object.assign({},p,{experience:p.experience.concat([{role:"",org:"",dates:"",desc:""}])});});}}/>
           </div>
-          <Btn ch="Save and Use This Resume" lg sx={{width:"100%",justifyContent:"center"}} onClick={async function(){
+          <div style={{display:"flex",gap:8}}>
+            <Btn ch="Download PDF" v="subtle" lg sx={{flex:1,justifyContent:"center"}} onClick={downloadResumePdf}/>
+            <Btn ch="Save and Use This Resume" lg sx={{flex:1,justifyContent:"center"}} onClick={async function(){
             if(sb&&props.user){
               await dbSaveProfile(props.user.uid, props.rd);
               await dbSaveResumeData(props.user.uid, props.rd);
               props.show("Resume data saved!");
             }
-            props.setResume({name:props.rd.firstName+"_"+props.rd.lastName+"_Resume.pdf",size:"42KB"});
+            props.setResume(function(prev){return {name:(prev&&prev.name)||props.rd.firstName+"_"+props.rd.lastName+"_Resume.pdf",size:(prev&&prev.size)||"Saved",url:(prev&&prev.url)||props.rd.resumeUrl||""};});
             props.show("Resume saved! You can now apply.");
             props.setTab("upload");
           }}/>
+          </div>
         </div>
         <div style={{position:"sticky",top:0}}><p style={{color:"#fff",fontWeight:700,fontSize:14,marginBottom:12}}>Live Preview</p><ResumeCard data={props.rd} tid={props.tmpl}/></div>
       </div>}
@@ -1370,7 +2075,7 @@ function StudentResumePage(props){
 // ─────────────────────────────────────────────────────────────
 function BizApp(props){
   var [nav,setNav]=useState(props.initialNav||"overview");
-  var [applicants,setApplicants]=useState(sb ? [] : LOCAL_APPLICANTS);
+  var [applicants,setApplicants]=useState([]);
   var [fj,setFj]=useState("all");
   var [selA,setSelA]=useState(null);
   var [showRes,setShowRes]=useState(false);
@@ -1378,15 +2083,24 @@ function BizApp(props){
   var [ivDraft,setIvDraft]=useState({date:"",time:"",loc:"",notes:""});
   var [showAdd,setShowAdd]=useState(false);
   var [editJobId,setEditJobId]=useState(null);
-  var [myJobs,setMyJobs]=useState(sb ? [] : LOCAL_JOBS.filter(function(j){return BIZ_IDS.includes(j.id);}));
+  var [myJobs,setMyJobs]=useState([]);
   var [nj,setNj]=useState(createEmptyJobDraft());
   var [biz,setBiz]=useState(createBusinessProfile(props.user&&props.user.businessProfile?props.user.businessProfile:{company:props.user?props.user.name:""}));
   var [editB,setEditB]=useState(false);
   var [bd,setBd]=useState(Object.assign({},biz));
+  var [selectedApps,setSelectedApps]=useState([]);
+  var [bellOpen,setBellOpen]=useState(false);
+  var [sharedTick,setSharedTick]=useState(0);
+  var sharedState = readSharedState();
+  var notifications = (sharedState.notifications || []).filter(function(note){ return note.role==="business" && note.userId === (props.user?.uid || "demo-biz"); });
 
   useEffect(function(){
     if(props.initialNav) setNav(props.initialNav);
   },[props.initialNav]);
+
+  useEffect(function(){
+    return bindSharedStateListener(function(){ setSharedTick(function(t){ return t+1; }); });
+  },[]);
 
   useEffect(function(){
     if(props.user&&props.user.businessProfile){
@@ -1400,7 +2114,7 @@ function BizApp(props){
   useEffect(function(){
     if(!sb||!props.user)return;
     dbLoadMyJobs(props.user.uid).then(function(data){
-      if(Array.isArray(data)) setMyJobs(data.map(normalizeJob));
+      if(Array.isArray(data)) setMyJobs(applySharedJobs(data.map(normalizeJob), false).filter(function(job){ return String(job.employerOwnerId || job.employer_id || "") === String(props.user.uid); }));
     });
     dbLoadEmployerProfile(props.user.uid).then(function(data){
       if(!data) return;
@@ -1414,7 +2128,10 @@ function BizApp(props){
         website: data.employer.website || "",
         industry: data.employer.industry || "",
         companySize: data.employer.company_size || "",
-        about: data.employer.about || ""
+        about: data.employer.about || "",
+        verificationStatus: data.employer.verification_status || "pending",
+        emailDomainMatch: data.employer.email_domain_match,
+        verificationSignal: data.employer.verification_signal || ""
       });
       setBiz(mapped);
       setBd(Object.assign({}, mapped));
@@ -1422,14 +2139,17 @@ function BizApp(props){
     dbLoadApplicants(props.user.uid).then(function(data){
       if(Array.isArray(data)){
         var mapped = data.map(function(a){
+          var sharedApp = getSharedApplicationById(a.id);
           var student = a.student || a.students || null;
           var interviews = Array.isArray(a.interviews) ? a.interviews : [];
           var firstName = a.profile && a.profile.first_name ? a.profile.first_name : (student && student.first_name ? student.first_name : "");
           var lastName = a.profile && a.profile.last_name ? a.profile.last_name : (student && student.last_name ? student.last_name : "");
           var fullName = (firstName + " " + lastName).trim();
+          var dbIv = interviews[0] ? {date: interviews[0].interview_date, time: interviews[0].interview_time, loc: interviews[0].location, notes: interviews[0].notes} : null;
           return {
             id: a.id,
             jobId: a.job_id,
+            studentId: a.student_id,
             name: fullName || (student && student.email) || "Student Applicant",
             school: student && student.school ? student.school : "",
             grade: student && student.grade ? student.grade : "",
@@ -1439,7 +2159,26 @@ function BizApp(props){
             status: a.status,
             note: a.note,
             ans: parseJsonObject(a.answers),
-            iv: interviews[0] ? {date: interviews[0].interview_date, time: interviews[0].interview_time, loc: interviews[0].location, notes: interviews[0].notes} : null
+            iv: sharedApp && sharedApp.iv ? Object.assign({}, dbIv || {}, sharedApp.iv) : dbIv,
+            resumeUrl: (student && student.resume_url) || (sharedApp && sharedApp.resumeUrl) || "",
+            resumeData: (sharedApp && sharedApp.resumeData) || {
+              firstName: firstName || "",
+              lastName: lastName || "",
+              email: student && student.email ? student.email : "",
+              phone: student && student.phone ? student.phone : "",
+              school: student && student.school ? student.school : "",
+              grade: student && student.grade ? student.grade : "",
+              gpa: student && student.gpa ? student.gpa : "",
+              summary: student && student.summary ? student.summary : "",
+              skills: student && Array.isArray(student.skills) ? student.skills : [],
+              activities: student && Array.isArray(student.activities) ? student.activities : [],
+              experience: student && Array.isArray(student.experience) ? student.experience : [],
+              resumeUrl: student && student.resume_url ? student.resume_url : ""
+            },
+            employerNotes: (sharedApp && sharedApp.employerNotes) || "",
+            starred: !!(sharedApp && sharedApp.starred),
+            flagged: !!(sharedApp && sharedApp.flagged),
+            messages: (sharedApp && sharedApp.messages) || (Array.isArray(a.messages) ? a.messages : [])
           };
         });
         setApplicants(mapped);
@@ -1447,21 +2186,121 @@ function BizApp(props){
         setApplicants([]);
       }
     });
-  },[props.user]);
+  },[props.user, sharedTick]);
+
+  useEffect(function(){
+    if(sb || !props.user) return;
+    var sharedJobs = applySharedJobs([]).filter(function(job){
+      return job.employerOwnerId === props.user.uid || (biz.co && job.co === biz.co);
+    });
+    setMyJobs(sharedJobs);
+    var mapped = getSharedApplicationsForJobs(sharedJobs.map(function(job){ return job.id; })).map(function(a){
+      return {
+        id:a.id,
+        jobId:a.jobId,
+        studentId:a.studentId,
+        name:a.studentName,
+        school:a.school,
+        grade:a.grade,
+        age:a.age,
+        email:a.email,
+        applied:a.applied,
+        status:a.status,
+        note:a.note,
+        ans:a.ans || {},
+        iv:a.iv || null,
+        resumeUrl:a.resumeUrl || "",
+        resumeData:a.resumeData || null,
+        employerNotes:a.employerNotes || "",
+        starred:!!a.starred,
+        flagged:!!a.flagged,
+        messages:a.messages || []
+      };
+    });
+    setApplicants(mapped);
+  },[props.user, biz.co, sharedTick]);
 
   async function updStatus(id,st){
     if(sb){var res=await dbUpdateAppStatus(id,st);if(res.error){props.show("Error: "+res.error,"err");return;}}
+    updateSharedState(function(state){
+      state.applications = state.applications.map(function(app){
+        return app.id===id ? Object.assign({}, app, { status:st }) : app;
+      });
+      return state;
+    });
     setApplicants(function(p){return p.map(function(a){return a.id===id?Object.assign({},a,{status:st}):a;});});
     setSelA(function(p){return p&&p.id===id?Object.assign({},p,{status:st}):p;});
+    var target = applicants.find(function(app){ return app.id===id; });
+    if(target){
+      addNotification({
+        userId: target.studentId || "demo-student",
+        role: "student",
+        title: "Application update",
+        body: "Your application for " + ((myJobs.find(function(job){ return job.id===target.jobId; }) || {}).title || "a job") + " is now " + st + ".",
+        nav: "apps",
+        appId: id,
+        jobId: target.jobId
+      });
+    }
     props.show(st==="accepted"?"Accepted!":st==="declined"?"Declined":"Moved to pending","info");
+  }
+
+  function bulkUpdate(status) {
+    selectedApps.forEach(function(id){ updStatus(id, status); });
+    setSelectedApps([]);
+  }
+
+  function sendEmployerMessage(appId, body) {
+    var applicant = applicants.find(function(entry){ return entry.id===appId; });
+    var message = { id:"msg-" + Date.now(), senderRole:"business", senderName:biz.co, body:body, createdAt:new Date().toISOString() };
+    if(sb) dbAppendApplicationMessage(appId, message);
+    upsertSharedApplication(appId, function(app){
+      return Object.assign({}, app, { messages:(app.messages || []).concat([message]) });
+    });
+    setApplicants(function(prev){
+      return prev.map(function(app){
+        return app.id===appId ? Object.assign({}, app, { messages:(app.messages || []).concat([message]) }) : app;
+      });
+    });
+    setSelA(function(prev){
+      return prev&&prev.id===appId ? Object.assign({}, prev, { messages:(prev.messages || []).concat([message]) }) : prev;
+    });
+    if(applicant){
+      addNotification({
+        userId: applicant.studentId || "demo-student",
+        role: "student",
+        title: "New employer message",
+        body: biz.co + " sent a message about your application.",
+        nav: "apps",
+        appId: appId
+      });
+    }
+    setSharedTick(function(t){ return t+1; });
+  }
+
+  function updateApplicantMeta(appId, fields) {
+    upsertSharedApplication(appId, function(app){
+      return Object.assign({}, app, fields);
+    });
+    setApplicants(function(prev){ return prev.map(function(app){ return app.id===appId ? Object.assign({}, app, fields) : app; }); });
+    setSelA(function(prev){ return prev&&prev.id===appId ? Object.assign({}, prev, fields) : prev; });
+    setSharedTick(function(t){ return t+1; });
   }
 
   async function schedIV(){
     if(!ivDraft.date||!ivDraft.time||!ivDraft.loc){props.show("Fill in date, time, and location","err");return;}
     if(sb&&selA){await dbScheduleInterview(selA.id,{interview_date:ivDraft.date,interview_time:ivDraft.time,location:ivDraft.loc,notes:ivDraft.notes});}
-    setApplicants(function(p){return p.map(function(a){return a.id===selA.id?Object.assign({},a,{iv:Object.assign({},ivDraft)}):a;});});
-    setSelA(function(p){return Object.assign({},p,{iv:Object.assign({},ivDraft)});});
+    updateApplicantMeta(selA.id,{iv:Object.assign({status:"pending_confirmation",responseNote:""},ivDraft)});
     setShowIV(false);props.show("Interview scheduled! Scheduled");
+    addNotification({
+      userId: selA.studentId || "demo-student",
+      role: "student",
+      title: "Interview scheduled",
+      body: "You have a new interview request from " + biz.co + ".",
+      nav: "ivs",
+      appId: selA.id,
+      jobId: selA.jobId
+    });
   }
 
   function openCreateJob(){
@@ -1476,20 +2315,62 @@ function BizApp(props){
     setShowAdd(true);
   }
 
+  async function deleteJob(job){
+    if(typeof window !== "undefined" && !window.confirm("Delete this job post? Students will no longer see it.")) return;
+    if(sb&&props.user){
+      var res = await dbDeleteJob(props.user.uid, job.id);
+      if(res.error){props.show("Error: "+res.error,"err");return;}
+    }
+    setMyJobs(function(prev){ return prev.filter(function(entry){ return String(entry.id) !== String(job.id); }); });
+    updateSharedState(function(state){
+      state.customJobs = (state.customJobs || []).filter(function(entry){ return String(entry.id) !== String(job.id); });
+      if(state.jobOverrides && state.jobOverrides[job.id]) delete state.jobOverrides[job.id];
+      return state;
+    });
+    if(String(fj) === String(job.id)) setFj("all");
+    if(selA && String(selA.jobId) === String(job.id)) setSelA(null);
+    props.show("Job deleted","info");
+  }
+
   async function addJob(){
     if(!nj.title||!nj.pay||!nj.desc){props.show("Title, pay, and description required","err");return;}
+    var selectedArea = resolveAreaByLabel(nj.areaLabel) || resolveAreaByLabel(inferAreaLabelFromJob({ loc:nj.loc }));
+    var coords = selectedArea && selectedArea.la != null ? { la:selectedArea.la, lo:selectedArea.lo } : getJobCoordinates({ loc:nj.loc, areaLabel:nj.areaLabel });
     var cleanedQuestions=nj.qs.filter(function(q){return q.trim();});
-    var jobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:cleanedQuestions,spots:parseInt(nj.spots,10)||1,tags:[],is_active:true};
+    var cleanedTags=(nj.tags || []).filter(Boolean);
+    var resolvedAreaLabel = (selectedArea && selectedArea.l) || inferAreaLabelFromJob({ loc:nj.loc }) || nj.areaLabel;
+    var dbJobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:cleanedQuestions,spots:parseInt(nj.spots,10)||1,is_active:true,area_label:resolvedAreaLabel};
+    var jobViewData={loc:nj.loc,sched:nj.sched,train:nj.train,desc:nj.desc,qs:cleanedQuestions,tags:cleanedTags,la:coords.la,lo:coords.lo,areaLabel:resolvedAreaLabel,spots:parseInt(nj.spots,10)||1};
     if(editJobId){
-      if(sb&&props.user){var updRes=await dbUpdateJob(props.user.uid,editJobId,jobData);if(updRes.error){props.show("Error: "+updRes.error,"err");return;}}
-      setMyJobs(function(p){return p.map(function(job){return String(job.id)===String(editJobId)?normalizeJob(Object.assign({},job,jobData,{loc:nj.loc,sched:nj.sched,train:nj.train,desc:nj.desc,qs:cleanedQuestions,co:biz.co})):job;});});
+      if(sb&&props.user){var updRes=await dbUpdateJob(props.user.uid,editJobId,dbJobData);if(updRes.error){props.show("Error: "+updRes.error,"err");return;}}
+      setMyJobs(function(p){return p.map(function(job){return String(job.id)===String(editJobId)?normalizeJob(Object.assign({},job,dbJobData,jobViewData,{co:biz.co})):job;});});
+      updateSharedState(function(state){
+        state.jobOverrides[editJobId] = Object.assign({}, state.jobOverrides[editJobId] || {}, dbJobData, jobViewData, { co:biz.co });
+        return state;
+      });
       setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());
       props.show("Job updated! Success");
       return;
     }
-    if(sb&&props.user){var res=await dbPostJob(props.user.uid,jobData);if(res.error){props.show("Error: "+res.error,"err");return;}}
-    var localJob=Object.assign({},jobData,{id:Date.now(),co:biz.co,logo:<FaStar />,clr:"#F59E0B",loc:nj.loc,la:32.793,lo:-96.807,posted:"Today",qs:cleanedQuestions});
+    var createdRow = null;
+    if(sb&&props.user){
+      var res=await dbPostJob(props.user.uid,dbJobData);
+      if(res.error){props.show("Error: "+res.error,"err");return;}
+      createdRow = res.data || null;
+    }
+    var newJobId = createdRow && createdRow.id ? createdRow.id : Date.now();
+    var storedJob=Object.assign({}, createdRow || dbJobData, jobViewData, {id:newJobId,co:biz.co,iconKey:"star",clr:"#F59E0B",posted:"Today",employerOwnerId:props.user.uid,verificationStatus:biz.verificationStatus || "pending",deadline:getDefaultDeadline(newJobId)});
+    var localJob=normalizeJob(storedJob);
     setMyJobs(function(p){return p.concat([localJob]);});
+    updateSharedState(function(state){
+      if(sb && createdRow && createdRow.id){
+        state.jobOverrides[createdRow.id] = Object.assign({}, state.jobOverrides[createdRow.id] || {}, jobViewData, { co:biz.co, employerOwnerId:props.user.uid, verificationStatus:biz.verificationStatus || "pending", iconKey:"star", clr:"#F59E0B", posted:"Today", deadline:getDefaultDeadline(newJobId) });
+      } else {
+        state.customJobs = (state.customJobs || []).filter(function(job){ return String(job.id) !== String(storedJob.id); }).concat([storedJob]);
+      }
+      return state;
+    });
+    setSharedTick(function(t){ return t+1; });
     setShowAdd(false);setNj(createEmptyJobDraft());
     props.show("Job posted! Success");
   }
@@ -1499,8 +2380,13 @@ function BizApp(props){
       var res = await dbSaveEmployerProfile(props.user.uid, bd);
       if(res.error){props.show("Error: "+res.error,"err");return;}
     }
-    setBiz(Object.assign({},bd));
+    var nextBiz = Object.assign({}, bd);
+    setBiz(nextBiz);
     setEditB(false);
+    updateSharedState(function(state){
+      state.employerProfiles[props.user.uid || "demo-biz"] = Object.assign({}, nextBiz, { verificationStatus: nextBiz.verificationStatus || biz.verificationStatus || "pending" });
+      return state;
+    });
     props.show("Updated! Success");
   }
 
@@ -1528,6 +2414,7 @@ function BizApp(props){
             <p style={{color:MU,fontSize:11}}>{biz.co} - Employer Dashboard</p>
           </div>
           <div style={{display:"flex",gap:9,alignItems:"center"}}>
+            <HeaderBell open={bellOpen} onToggle={function(){setBellOpen(!bellOpen);}} onClose={function(){setBellOpen(false);}} notifications={notifications} onMarkRead={function(){markNotificationsRead(props.user.uid || "demo-biz","business");setSharedTick(function(t){return t+1;});}} onJump={function(note){setBellOpen(false);if(note.nav) setNav(note.nav);}}/>
             <Btn ch="+ Post New Job" v="or" sm sx={{background:OR,color:"#000"}} onClick={openCreateJob}/>
             <span style={pill(OR)}><FaBriefcase style={{marginRight:4}}/> Employer</span>
           </div>
@@ -1554,6 +2441,8 @@ function BizApp(props){
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><p style={{color:MU,fontSize:13}}>{myJobs.length} listings for {biz.co}</p><Btn ch="+ Post New Job" v="or" sx={{background:OR,color:"#000"}} onClick={openCreateJob}/></div>
             <div style={{display:"flex",flexDirection:"column",gap:11}}>{myJobs.map(function(j){
               var a2=applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;});
+              var views = sharedState.jobViews[j.id] || 0;
+              var conversion = views ? Math.round((a2.length / views) * 100) : 0;
               return <div key={j.id} style={bx({border:"1px solid "+j.clr+"33"})}>
                 <div style={{display:"flex",gap:12}}>
                   <div style={{width:46,height:46,borderRadius:11,background:j.clr+"22",border:"1px solid "+j.clr+"44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{j.logo}</div>
@@ -1563,7 +2452,10 @@ function BizApp(props){
                     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
                       {[{l:"Applied",n:a2.length,c:BL},{l:"Pending",n:a2.filter(function(a){return a.status==="pending";}).length,c:WN},{l:"Open",n:j.spots||1,c:OR}].map(function(s){return <div key={s.l} style={{background:BG,borderRadius:9,padding:"8px 11px",border:"1px solid "+BR}}><p style={{color:s.c,fontFamily:FH,fontSize:18,fontWeight:800}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.l}</p></div>;})}
                     </div>
-                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/><Btn ch="Edit Post" v="gh" sm onClick={function(){openEditJob(j);}}/></div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginTop:8}}>
+                      {[{l:"Views",n:views,c:PR},{l:"Applied",n:a2.length,c:BL},{l:"Conversion",n:conversion+"%",c:"#10B981"}].map(function(s){return <div key={s.l} style={{background:"rgba(255,255,255,0.03)",borderRadius:9,padding:"8px 11px",border:"1px solid "+BR}}><p style={{color:s.c,fontFamily:FH,fontSize:18,fontWeight:800}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.l}</p></div>;})}
+                    </div>
+                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11,flexWrap:"wrap"}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/><Btn ch="Edit Post" v="subtle" sm onClick={function(){openEditJob(j);}}/><Btn ch="Delete Post" v="dn" sm onClick={function(){deleteJob(j);}}/></div>
                   </div>
                 </div>
               </div>;
@@ -1577,6 +2469,7 @@ function BizApp(props){
                 {myJobs.map(function(j){return <option key={j.id} value={String(j.id)}>{j.title} ({applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;}).length})</option>;})}
               </select>
               <div style={{display:"flex",gap:6}}>{[{s:"pending",c:WN},{s:"accepted",c:"#10B981"},{s:"declined",c:DN}].map(function(x){return <span key={x.s} style={pill(x.c)}>{x.s} ({applicants.filter(function(a){return a.status===x.s;}).length})</span>;})}</div>
+              {selectedApps.length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap"}}><Btn ch={"Accept ("+selectedApps.length+")"} sm onClick={function(){bulkUpdate("accepted");}}/><Btn ch="Decline" v="dn" sm onClick={function(){bulkUpdate("declined");}}/><Btn ch="Move to Pending" v="subtle" sm onClick={function(){bulkUpdate("pending");}}/></div>}
             </div>
             {disp.length===0&&<p style={{color:MU,textAlign:"center",padding:"30px 0"}}>No applicants yet.</p>}
             <div style={{display:"flex",flexDirection:"column",gap:9}}>{disp.map(function(a){
@@ -1585,11 +2478,12 @@ function BizApp(props){
               var scol=a.status==="pending"?WN:a.status==="accepted"?"#10B981":DN;
               return <div key={a.id} className="jc" onClick={function(){setSelA(isSel?null:a);}} style={bx({border:"1px solid "+(isSel?OR+"66":BR)})}>
                 <div style={{display:"flex",gap:11}}>
+                  <input type="checkbox" checked={selectedApps.includes(a.id)} onChange={function(e){e.stopPropagation();setSelectedApps(function(prev){return prev.includes(a.id)?prev.filter(function(id){return id!==a.id;}):prev.concat([a.id]);});}} style={{marginTop:12}}/>
                   <div style={{width:42,height:42,borderRadius:11,background:OR+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0}}><FaUser /></div>
                   <div style={{flex:1}}>
                     <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
                       <div><p style={{color:"#fff",fontWeight:800,fontSize:13,fontFamily:FH}}>{a.name}</p><p style={{color:MU,fontSize:12}}>{a.school} - {a.grade} - Age {a.age}</p></div>
-                      <div style={{display:"flex",gap:6,alignItems:"center"}}>{a.iv&&<span style={pill(PR)}><FaCalendar style={{marginRight:4}}/> Interview Set</span>}<span style={pill(scol)}>{a.status}</span></div>
+                      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{starred:!a.starred});}} style={{cursor:"pointer",color:a.starred?WN:MU,fontSize:14}}><FaStar /></span><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{flagged:!a.flagged});}} style={{cursor:"pointer",color:a.flagged?DN:MU,fontSize:14}}><FaFlag /></span>{a.iv&&<span style={pill(PR)}><FaCalendar style={{marginRight:4}}/> Interview Set</span>}<span style={pill(scol)}>{a.status}</span></div>
                     </div>
                     <div style={{display:"flex",gap:10,marginTop:5,flexWrap:"wrap"}}><span style={{color:MU,fontSize:11}}>{j?j.title:""}</span><span style={{color:MU,fontSize:11}}>Applied: {a.applied}</span><span style={{color:MU,fontSize:11}}>{a.email}</span></div>
                     {a.note&&<p style={{color:"#ccc",fontSize:12,marginTop:7,padding:"7px 10px",background:BG,borderRadius:7}}>"{a.note}"</p>}
@@ -1597,13 +2491,16 @@ function BizApp(props){
                 </div>
                 {isSel&&<div style={{marginTop:11,paddingTop:11,borderTop:"1px solid "+BR}}>
                   {a.ans&&Object.keys(a.ans).length>0&&<div style={bx({background:BG,marginBottom:10})}><p style={{color:BL,fontSize:11,fontWeight:800,marginBottom:8,display:"flex",alignItems:"center",gap:6}}><FaStickyNote /> Applicant Answers</p>{Object.entries(a.ans).map(function(entry){return <div key={entry[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:2}}>{entry[0]}</p><p style={{color:"#D1D5DB",fontSize:12,lineHeight:1.6}}>{entry[1]}</p></div>;})}</div>}
+                  <div style={bx({background:BG,marginBottom:10})}><p style={{color:OR,fontSize:11,fontWeight:800,marginBottom:6}}>Private Employer Notes</p><Txa v={a.employerNotes||""} onClick={function(e){e.stopPropagation();}} onChange={function(e){var val=e.target.value;updateApplicantMeta(a.id,{employerNotes:val});}} h={64} ph="Internal notes only your team can see..." /></div>
+                  {a.iv&&a.iv.status==="requested_new_time"&&<div style={{background:"rgba(245,158,11,0.08)",border:"1px solid "+WN+"44",borderRadius:9,padding:"10px 12px",marginBottom:10}}><p style={{color:WN,fontSize:12,fontWeight:800}}>Student requested a different time</p><p style={{color:"#FDE68A",fontSize:11,marginTop:4}}>{a.iv.responseNote || "No note provided."}</p></div>}
                   <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
-                    <Btn ch={<><FaFileAlt style={{marginRight:4}}/> View Resume</>} v="gh" sm onClick={function(e){e.stopPropagation();setShowRes(true);}}/>
+                    <Btn ch={<><FaFileAlt style={{marginRight:4}}/> View Resume</>} v="subtle" sm onClick={function(e){e.stopPropagation();setShowRes(true);}}/>
                     {a.status!=="accepted"&&<Btn ch="Accept" sm onClick={function(e){e.stopPropagation();updStatus(a.id,"accepted");}}/>}
                     {a.status!=="declined"&&<Btn ch="Decline" v="dn" sm onClick={function(e){e.stopPropagation();updStatus(a.id,"declined");}}/>}
-                    {a.status!=="pending"&&<Btn ch="Move to Pending" v="gh" sm onClick={function(e){e.stopPropagation();updStatus(a.id,"pending");}}/>}
-                    {a.status==="accepted"&&<Btn ch={<><FaCalendar style={{marginRight:4}}/>{a.iv?"Edit Interview":"Schedule Interview"}</>} v="gh" sm sx={{background:PR+"22",color:PR,border:"1px solid "+PR+"44"}} onClick={function(e){e.stopPropagation();setShowIV(true);setIvDraft(a.iv||{date:"",time:"",loc:"",notes:""}); }}/>}
+                    {a.status!=="pending"&&<Btn ch="Move to Pending" v="subtle" sm onClick={function(e){e.stopPropagation();updStatus(a.id,"pending");}}/>}
+                    {a.status==="accepted"&&<Btn ch={<><FaCalendar style={{marginRight:4}}/>{a.iv?"Edit Interview":"Schedule Interview"}</>} v="subtle" sm sx={{background:PR+"22",color:PR,border:"1px solid "+PR+"44"}} onClick={function(e){e.stopPropagation();setShowIV(true);setIvDraft(a.iv||{date:"",time:"",loc:"",notes:""}); }}/>}
                   </div>
+                  <ApplicationMessages role="business" messages={a.messages||[]} onSend={function(body){sendEmployerMessage(a.id, body);}} placeholder="Message this student in-app..." />
                 </div>}
               </div>;
             })}</div>
@@ -1615,15 +2512,15 @@ function BizApp(props){
             <div style={bx({marginBottom:14,display:"flex",gap:14,alignItems:"center",flexWrap:"wrap"})}>
               <div style={{width:56,height:56,borderRadius:16,background:"linear-gradient(135deg,"+OR+",#FF3B80)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,flexShrink:0}}><FaBuilding /></div>
               <div style={{flex:1}}><h2 style={{fontFamily:FH,fontSize:18,fontWeight:800,color:"#fff",marginBottom:2}}>{biz.co}</h2><p style={{color:MU,fontSize:12}}>{biz.ind} - {biz.size}</p><p style={{color:MU,fontSize:12,marginTop:2}}>{biz.about}</p></div>
-              <Btn ch={editB?"Cancel":"Edit Profile"} v={editB?"gh":"or"} sx={editB?{}:{background:OR,color:"#000"}} onClick={function(){setBd(Object.assign({},biz));setEditB(!editB);}}/>
+              <Btn ch={editB?"Cancel":"Edit Profile"} v={editB?"subtle":"or"} sx={editB?{}:{background:OR,color:"#000"}} onClick={function(){setBd(Object.assign({},biz));setEditB(!editB);}}/>
             </div>
             {editB?<div style={bx()}>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:9}}>{[["co","Company Name"],["nm","Your Name"],["email","Email"],["phone","Phone"],["addr","Address"],["web","Website"],["ind","Industry"],["size","Company Size"]].map(function(pair){return <div key={pair[0]}><Lbl t={pair[1].toUpperCase()}/><Inp v={bd[pair[0]]} onChange={function(e){var val=e.target.value;setBd(function(p){return Object.assign({},p,{[pair[0]]:val});});}}/></div>;})}</div>
               <div style={{marginBottom:14}}><Lbl t="ABOUT"/><Txa v={bd.about} onChange={function(e){var val=e.target.value;setBd(function(p){return Object.assign({},p,{about:val});});}} h={68}/></div>
-              <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg sx={{background:OR,color:"#000"}} onClick={saveBizProfile}/><Btn ch="Cancel" v="gh" onClick={function(){setEditB(false);}}/></div>
+              <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg sx={{background:OR,color:"#000"}} onClick={saveBizProfile}/><Btn ch="Cancel" v="subtle" onClick={function(){setEditB(false);}}/></div>
             </div>:<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:13}}>
               <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Contact and Details</h3>{[["Company",biz.co],["Contact",biz.nm],["Email",biz.email],["Phone",biz.phone],["Address",biz.addr],["Website",biz.web]].map(function(pair){return <div key={pair[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:10,fontWeight:700}}>{pair[0]}</p><p style={{color:"#fff",fontSize:12,fontWeight:600}}>{pair[1]}</p></div>;})}</div>
-              <div style={bx()}><Lbl t="INDUSTRY"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.ind}</p><Lbl t="SIZE"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.size}</p><Lbl t="ABOUT"/><p style={{color:MU,fontSize:12,lineHeight:1.7,marginBottom:12}}>{biz.about}</p><div style={{background:OR+"11",border:"1px solid "+OR+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:OR,fontSize:11,fontWeight:800,marginBottom:2}}>Verified Employer</p><p style={{color:"#FED7AA",fontSize:11}}>Approved to post on LaunchDFW.</p></div></div>
+              <div style={bx()}><Lbl t="INDUSTRY"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.ind}</p><Lbl t="SIZE"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.size}</p><Lbl t="ABOUT"/><p style={{color:MU,fontSize:12,lineHeight:1.7,marginBottom:12}}>{biz.about}</p><div style={{background:getVerificationBadge(biz.verificationStatus).bg,border:"1px solid "+getVerificationBadge(biz.verificationStatus).color+"33",borderRadius:9,padding:"9px 11px",marginBottom:10}}><p style={{color:getVerificationBadge(biz.verificationStatus).color,fontSize:11,fontWeight:800,marginBottom:2}}>{getVerificationBadge(biz.verificationStatus).text}</p><p style={{color:"#FED7AA",fontSize:11}}>{biz.verificationStatus==="approved"?"Students will see your green verified badge on your profile and job listings.":"Your business stays pending until reviewed manually in the Supabase dashboard."}</p></div>{biz.verificationStatus!=="approved"&&<div style={{background:(biz.emailDomainMatch?PR:WN)+"11",border:"1px solid "+(biz.emailDomainMatch?PR:WN)+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:biz.emailDomainMatch?PR:WN,fontSize:11,fontWeight:800,marginBottom:2}}>{biz.emailDomainMatch?"Email Matches Website Domain":"Manual Review Required"}</p><p style={{color:MU,fontSize:11}}>{biz.emailDomainMatch?"Your sign-up email appears to match your business website domain, which helps reviewers approve faster.":"Use a business email that matches your website domain to improve verification confidence."}</p></div>}</div>
             </div>}
           </div>}
         </div>
@@ -1632,18 +2529,26 @@ function BizApp(props){
       {showRes&&selA&&<Modal onClose={function(){setShowRes(false);}} w={600}>
         <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div><p style={{color:OR,fontSize:10,fontWeight:800,marginBottom:2}}>APPLICANT RESUME</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{selA.name}</h2></div>
-          <Btn ch="Close" v="gh" sm onClick={function(){setShowRes(false);}}/>
+          <Btn ch="Close" v="subtle" sm onClick={function(){setShowRes(false);}}/>
         </div>
         <div style={{padding:"14px 18px"}}>
           <div style={bx({background:BG,marginBottom:14})}><div style={{display:"flex",gap:14,flexWrap:"wrap"}}>{[["Name",selA.name],["School",selA.school],["Grade",selA.grade],["Age",selA.age],["Email",selA.email]].map(function(pair){return <div key={pair[0]}><p style={{color:MU,fontSize:10}}>{pair[0]}</p><p style={{color:"#fff",fontSize:12,fontWeight:700}}>{pair[1]}</p></div>;})}</div></div>
-          <ResumeCard data={Object.assign({},EX_DATA,{firstName:selA.name.split(" ")[0],lastName:selA.name.split(" ").slice(1).join(" "),school:selA.school,grade:selA.grade,email:selA.email})} tid="classic"/>
+          {(selA.resumeUrl || (selA.resumeData && selA.resumeData.resumeUrl))&&<div style={{marginBottom:14}}>
+            <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+              <Btn ch={<><FaDownload style={{marginRight:4}}/> Open Original Resume</>} sm onClick={function(){window.open(selA.resumeUrl || (selA.resumeData && selA.resumeData.resumeUrl),"_blank");}}/>
+            </div>
+            <div style={{background:"#fff",borderRadius:12,overflow:"hidden",minHeight:420}}>
+              <iframe title="Applicant Resume" src={getResumePreviewUrl(selA.resumeUrl || (selA.resumeData && selA.resumeData.resumeUrl))} style={{width:"100%",height:420,border:"none"}} />
+            </div>
+          </div>}
+          <ResumeCard data={Object.assign({},createResumeData(selA.resumeData || {}),selA.resumeData || {},{firstName:(selA.resumeData&&selA.resumeData.firstName)||selA.name.split(" ")[0],lastName:(selA.resumeData&&selA.resumeData.lastName)||selA.name.split(" ").slice(1).join(" "),school:(selA.resumeData&&selA.resumeData.school)||selA.school,grade:(selA.resumeData&&selA.resumeData.grade)||selA.grade,email:(selA.resumeData&&selA.resumeData.email)||selA.email})} tid="classic"/>
         </div>
       </Modal>}
 
       {showIV&&selA&&<Modal onClose={function(){setShowIV(false);}}>
         <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div><p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:2}}>SCHEDULE INTERVIEW</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{selA.name}</h2></div>
-          <Btn ch="X" v="gh" sm onClick={function(){setShowIV(false);}}/>
+          <Btn ch="X" v="subtle" sm onClick={function(){setShowIV(false);}}/>
         </div>
         <div style={{padding:"14px 18px 18px"}}>
           <p style={{color:MU,fontSize:13,marginBottom:14}}>The student will see this in their Interviews tab.</p>
@@ -1653,14 +2558,14 @@ function BizApp(props){
           </div>
           <div style={{marginBottom:9}}><Lbl t="LOCATION"/><Inp v={ivDraft.loc} onChange={function(e){var val=e.target.value;setIvDraft(function(p){return Object.assign({},p,{loc:val});});}} ph="e.g. 2817 Commerce St or Video Call"/></div>
           <div style={{marginBottom:14}}><Lbl t="NOTES FOR STUDENT (optional)"/><Txa v={ivDraft.notes} onChange={function(e){var val=e.target.value;setIvDraft(function(p){return Object.assign({},p,{notes:val});});}} ph="e.g. Bring your resume. Arrive 10 min early." h={64}/></div>
-          <div style={{display:"flex",gap:8}}><Btn ch="Confirm Interview" lg sx={{flex:1,justifyContent:"center",background:PR,color:"#000"}} onClick={schedIV}/><Btn ch="Cancel" v="gh" onClick={function(){setShowIV(false);}}/></div>
+          <div style={{display:"flex",gap:8}}><Btn ch="Confirm Interview" lg sx={{flex:1,justifyContent:"center",background:PR,color:"#000"}} onClick={schedIV}/><Btn ch="Cancel" v="subtle" onClick={function(){setShowIV(false);}}/></div>
         </div>
       </Modal>}
 
       {showAdd&&<Modal onClose={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}>
         <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div><p style={{color:OR,fontSize:10,fontWeight:800,marginBottom:2}}>{editJobId?"EDIT JOB POST":"NEW JOB POST"}</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{editJobId?"Update":"Post a Job for"} {biz.co}</h2></div>
-          <Btn ch="X" v="gh" sm onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/>
+          <Btn ch="X" v="subtle" sm onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/>
         </div>
         <div style={{padding:"14px 18px 18px",maxHeight:"70vh",overflowY:"auto"}}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:9}}>
@@ -1668,16 +2573,26 @@ function BizApp(props){
             <div><Lbl t="JOB TYPE"/><select value={nj.type} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{type:val});});}} style={Object.assign({},INP,{cursor:"pointer"})}>{["Part-Time","Internship","Seasonal","Full-Time"].map(function(t){return <option key={t}>{t}</option>;})}</select></div>
             <div><Lbl t="PAY RATE (required)"/><Inp v={nj.pay} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{pay:val});});}} ph="e.g. $13/hr"/></div>
             <div><Lbl t="LOCATION"/><Inp v={nj.loc} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{loc:val});});}} ph="e.g. Uptown Dallas"/></div>
+            <div><Lbl t="METRO AREA"/><select value={nj.areaLabel} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{areaLabel:val});});}} style={Object.assign({},INP,{cursor:"pointer"})}>{AREAS.map(function(area){return <option key={area.l} value={area.l}>{area.l}</option>;})}</select></div>
             <div><Lbl t="SCHEDULE"/><Inp v={nj.sched} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{sched:val});});}} ph="e.g. Weekends"/></div>
             <div><Lbl t="TRAINING PROVIDED"/><Inp v={nj.train} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{train:val});});}} ph="e.g. Full training"/></div>
             <div><Lbl t="OPEN SPOTS"/><Inp v={String(nj.spots||1)} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{spots:val});});}} ph="1" tp="number"/></div>
           </div>
           <div style={{marginBottom:12}}><Lbl t="DESCRIPTION (required)"/><Txa v={nj.desc} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{desc:val});});}} ph="Describe the role..." h={72}/></div>
           <div style={{marginBottom:14}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><Lbl t="CUSTOM QUESTIONS FOR APPLICANTS"/><Btn ch="+ Add" v="gh" sm onClick={function(){setNj(function(p){return Object.assign({},p,{qs:p.qs.concat([""])});});}}/></div>
+            <Lbl t="STUDENT-SIDE FILTER TAGS"/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {JOB_FILTER_TAGS.map(function(tag){
+                var active = (nj.tags || []).includes(tag);
+                return <span key={tag} className="ni" onClick={function(){setNj(function(prev){return Object.assign({},prev,{tags:active?prev.tags.filter(function(entry){return entry!==tag;}):prev.tags.concat([tag])});});}} style={{background:active?OR+"22":"rgba(255,255,255,0.05)",border:"1px solid "+(active?OR+"55":BR),borderRadius:999,padding:"6px 10px",fontSize:11,color:active?OR:MU,cursor:"pointer",fontWeight:700}}>{active?"✓ ":""}{tag}</span>;
+              })}
+            </div>
+          </div>
+          <div style={{marginBottom:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><Lbl t="CUSTOM QUESTIONS FOR APPLICANTS"/><Btn ch="+ Add" v="subtle" sm onClick={function(){setNj(function(p){return Object.assign({},p,{qs:p.qs.concat([""])});});}}/></div>
             {nj.qs.map(function(q2,i){return <div key={i} style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}><span style={{width:18,height:18,borderRadius:5,background:BL+"22",border:"1px solid "+BL+"44",display:"flex",alignItems:"center",justifyContent:"center",color:BL,fontSize:9,fontWeight:800,flexShrink:0}}>Q{i+1}</span><Inp v={q2} onChange={function(e){var val=e.target.value;setNj(function(p){var qs2=p.qs.slice();qs2[i]=val;return Object.assign({},p,{qs:qs2});});}} ph={"Question "+(i+1)+"..."} sx={{flex:1}}/>{nj.qs.length>1&&<span className="hov" onClick={function(){setNj(function(p){return Object.assign({},p,{qs:p.qs.filter(function(_,j2){return j2!==i;})});});}} style={{color:DN,fontSize:16,cursor:"pointer",padding:4}}>x</span>}</div>;})}
           </div>
-          <div style={{display:"flex",gap:8}}><Btn ch={editJobId?"Save Job Changes":"Post Job Listing"} lg sx={{flex:1,justifyContent:"center",background:OR,color:"#000"}} onClick={addJob}/><Btn ch="Cancel" v="gh" onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/></div>
+          <div style={{display:"flex",gap:8}}><Btn ch={editJobId?"Save Job Changes":"Post Job Listing"} lg sx={{flex:1,justifyContent:"center",background:OR,color:"#000"}} onClick={addJob}/><Btn ch="Cancel" v="subtle" onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/></div>
         </div>
       </Modal>}
     </div>
