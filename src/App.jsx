@@ -19,11 +19,38 @@ async function dbSignUp(email, password, role, extra) {
   var res = await sb.auth.signUp({ email: email, password: password });
   if (res.error) return { error: res.error.message };
   var uid = res.data.user.id;
-  await sb.from("profiles").insert({ id: uid, role: role, email: email, first_name: extra.firstName || "", last_name: extra.lastName || "" });
+  var profileRes = await sb.from("profiles").insert({ id: uid, role: role, email: email, first_name: extra.firstName || "", last_name: extra.lastName || "" });
+  if (profileRes.error) return { error: profileRes.error.message };
   if (role === "student") {
-    await sb.from("students").insert({ id: uid, school: extra.school || "", grade: extra.grade || "", skills: [] });
+    var studentRes = await sb.from("students").insert({
+      id: uid,
+      email: email,
+      phone: extra.phone || "",
+      school: extra.school || "",
+      grade: extra.grade || "",
+      age: extra.age || "",
+      bio: extra.bio || "",
+      summary: extra.summary || extra.bio || "",
+      skills: extra.skills || [],
+      activities: extra.activities || [],
+      experience: extra.experience || [],
+      gpa: extra.gpa || ""
+    });
+    if (studentRes.error) return { error: studentRes.error.message };
   } else {
-    await sb.from("employers").insert({ id: uid, company_name: extra.company || "" });
+    var employerRes = await sb.from("employers").insert({
+      id: uid,
+      company_name: extra.company || "",
+      contact_name: buildFullName(extra.firstName, extra.lastName),
+      email: email,
+      phone: extra.phone || "",
+      address: extra.address || "",
+      website: extra.website || "",
+      industry: extra.industry || "",
+      company_size: extra.companySize || "",
+      about: extra.about || ""
+    });
+    if (employerRes.error) return { error: employerRes.error.message };
   }
   return { uid: uid, role: role };
 }
@@ -163,6 +190,48 @@ async function dbPostJob(employerId, job) {
   return res.error ? { error: res.error.message } : { ok: true };
 }
 
+async function dbUpdateJob(employerId, jobId, job) {
+  if (!sb) return { error: "not_connected" };
+  var res = await sb.from("jobs").update(job).eq("id", jobId).eq("employer_id", employerId);
+  return res.error ? { error: res.error.message } : { ok: true };
+}
+
+async function dbLoadEmployerProfile(employerId) {
+  if (!sb) return null;
+  var profileRes = await sb.from("profiles").select("first_name,last_name,email").eq("id", employerId).maybeSingle();
+  var employerRes = await sb.from("employers").select("*").eq("id", employerId).maybeSingle();
+  if (profileRes.error && employerRes.error) return null;
+  return {
+    profile: profileRes.data || {},
+    employer: employerRes.data || {}
+  };
+}
+
+async function dbSaveEmployerProfile(employerId, bizData) {
+  if (!sb) return { error: "not_connected" };
+  var nameParts = splitName(bizData.nm);
+  var profileRes = await sb.from("profiles").update({
+    first_name: nameParts.firstName,
+    last_name: nameParts.lastName,
+    email: bizData.email
+  }).eq("id", employerId);
+  if (profileRes.error) return { error: profileRes.error.message };
+
+  var employerRes = await sb.from("employers").update({
+    company_name: bizData.co,
+    contact_name: bizData.nm,
+    email: bizData.email,
+    phone: bizData.phone,
+    address: bizData.addr,
+    website: bizData.web,
+    industry: bizData.ind,
+    company_size: bizData.size,
+    about: bizData.about
+  }).eq("id", employerId);
+  if (employerRes.error) return { error: employerRes.error.message };
+  return { ok: true };
+}
+
 async function dbLoadApplicants(employerId) {
   if (!sb) return null;
   var jobsRes = await sb.from("jobs").select("id").eq("employer_id", employerId);
@@ -279,6 +348,81 @@ function parseJsonObject(value) {
     }
   }
   return {};
+}
+
+function splitName(fullName) {
+  var parts = (fullName || "").trim().split(/\s+/).filter(Boolean);
+  return {
+    firstName: parts[0] || "",
+    lastName: parts.slice(1).join(" ")
+  };
+}
+
+function buildFullName(firstName, lastName) {
+  return [firstName, lastName].filter(Boolean).join(" ").trim();
+}
+
+function createStudentProfile(extra) {
+  return {
+    firstName: extra.firstName || "Alex",
+    lastName: extra.lastName || "Johnson",
+    email: extra.email || "alex.j@email.com",
+    phone: extra.phone || "(214) 555-0192",
+    school: extra.school || "Skyline High School",
+    grade: extra.grade || "11th Grade",
+    age: extra.age || "17",
+    bio: extra.bio || "Motivated student looking for part-time work in the Dallas area.",
+    skills: Array.isArray(extra.skills) ? extra.skills : ["Customer Service", "Microsoft Office", "Canva"]
+  };
+}
+
+function createResumeData(extra) {
+  return {
+    firstName: extra.firstName || "Alex",
+    lastName: extra.lastName || "Johnson",
+    email: extra.email || "alex.j@email.com",
+    phone: extra.phone || "(214) 555-0192",
+    school: extra.school || "Skyline High School",
+    grade: extra.grade || "11th Grade",
+    gpa: extra.gpa || "3.8",
+    summary: extra.summary || extra.bio || "Motivated student seeking part-time work to build professional skills.",
+    skills: Array.isArray(extra.skills) ? extra.skills : ["Customer Service", "Microsoft Office", "Canva"],
+    activities: Array.isArray(extra.activities) ? extra.activities : ["Debate Club Captain", "National Honor Society"],
+    experience: Array.isArray(extra.experience) && extra.experience.length ? extra.experience : [{role:"Volunteer",org:"Dallas Food Bank",dates:"Sep 2024-Present",desc:"Sorted donations for 200+ families per shift."}],
+    resumeUrl: extra.resumeUrl || ""
+  };
+}
+
+function createBusinessProfile(extra) {
+  return {
+    co: extra.company || "Houndstooth Coffee",
+    nm: buildFullName(extra.firstName, extra.lastName) || "Sarah Mitchell",
+    email: extra.email || "sarah@houndstooth.com",
+    phone: extra.phone || "(214) 555-3377",
+    addr: extra.address || "2817 Commerce St, Dallas TX",
+    web: extra.website || "houndstoothcoffee.com",
+    ind: extra.industry || "Food and Beverage",
+    size: extra.companySize || "11-50 employees",
+    about: extra.about || "Specialty coffee shop committed to quality and community. We love giving first-time workers their start."
+  };
+}
+
+function createEmptyJobDraft() {
+  return { title:"", type:"Part-Time", pay:"", loc:"", sched:"", train:"", desc:"", qs:[""], spots:1 };
+}
+
+function jobToDraft(job) {
+  return {
+    title: job.title || "",
+    type: job.type || "Part-Time",
+    pay: job.pay || "",
+    loc: job.loc || job.location || "",
+    sched: job.sched || job.schedule || "",
+    train: job.train || job.training || "",
+    desc: job.desc || job.description || "",
+    qs: parseJobQuestions(job.qs || job.questions).length ? parseJobQuestions(job.qs || job.questions) : [""],
+    spots: job.spots || 1
+  };
 }
 
 function normalizeJob(job) {
@@ -495,8 +639,8 @@ export default function App(){
       <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet"/>
       <style>{`*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}.hov:hover{opacity:0.85}.jc{transition:all .15s;cursor:pointer}.jc:hover{background:#1A2540!important;transform:translateY(-1px)}.ni{transition:all .12s;cursor:pointer}.ni:hover{background:rgba(255,255,255,.07)!important}input,textarea,select{color-scheme:dark}textarea{resize:vertical;font-family:'Plus Jakarta Sans',sans-serif}`}</style>
       {screen==="login"   &&<LoginScreen onLogin={handleLogin} show={show}/>}
-      {screen==="student" &&<StudentApp user={user} show={show} logout={handleLogout}/>}
-      {screen==="business"&&<BizApp     user={user} show={show} logout={handleLogout}/>}
+      {screen==="student" &&<StudentApp user={user} show={show} logout={handleLogout} initialNav={user&&user.startNav}/>}
+      {screen==="business"&&<BizApp     user={user} show={show} logout={handleLogout} initialNav={user&&user.startNav}/>}
       {toast&&<div style={{position:"fixed",bottom:20,left:"50%",transform:"translateX(-50%)",background:toast.t==="err"?DN:toast.t==="info"?BL:PR,color:toast.t==="info"?"#fff":"#000",borderRadius:12,padding:"10px 20px",fontWeight:700,fontSize:13,zIndex:999,whiteSpace:"nowrap"}}>{toast.t==="err"?<FaTimes />:<FaCheck />} {toast.msg}</div>}
     </div>
   );
@@ -509,24 +653,23 @@ function LoginScreen(props){
   var [mode,setMode]=useState("pick");
   var [email,setEmail]=useState("");
   var [pw,setPw]=useState("");
-  var [name,setName]=useState("");
-  var [school,setSchool]=useState("");
-  var [company,setCompany]=useState("");
+  var [studentForm,setStudentForm]=useState({firstName:"",lastName:"",school:"",grade:"",age:"",phone:"",bio:""});
+  var [businessForm,setBusinessForm]=useState({company:"",firstName:"",lastName:"",phone:"",address:"",website:"",industry:"",companySize:"",about:""});
   var [isNew,setIsNew]=useState(false);
   var [loading,setLoading]=useState(false);
 
   async function handleStudentAuth(){
     if(!email||!pw){props.show("Enter email and password","err");return;}
-    if(isNew&&!name){props.show("Enter your full name","err");return;}
+    if(isNew&&(!studentForm.firstName||!studentForm.lastName||!studentForm.school||!studentForm.grade||!studentForm.age||!studentForm.phone)){props.show("Complete all required student fields","err");return;}
     setLoading(true);
     if(!sb){
       // Demo mode - no real auth
-      props.onLogin({uid:"demo-student",role:"student",name:name||"Alex Johnson"});
+      props.onLogin({uid:"demo-student",role:"student",name:buildFullName(studentForm.firstName, studentForm.lastName)||"Alex Johnson",startNav:isNew?"profile":"jobs",studentProfile:createStudentProfile(Object.assign({},studentForm,{email:email}))});
       setLoading(false);return;
     }
     var res;
     if(isNew){
-      res=await dbSignUp(email,pw,"student",{firstName:name.split(" ")[0],lastName:name.split(" ")[1]||"",school});
+      res=await dbSignUp(email,pw,"student",Object.assign({},studentForm,{email:email,summary:studentForm.bio}));
     } else {
       res=await dbSignIn(email,pw);
       if(res.role && res.role !== "student"){
@@ -536,20 +679,20 @@ function LoginScreen(props){
     }
     setLoading(false);
     if(res.error){props.show(res.error==="not_connected"?"Add your Supabase keys to connect":res.error,"err");return;}
-    props.onLogin({uid:res.uid||res.uid,role:"student",name:res.name||name});
+    props.onLogin({uid:res.uid||res.uid,role:"student",name:res.name||buildFullName(studentForm.firstName, studentForm.lastName),startNav:isNew?"profile":"jobs",studentProfile:isNew?createStudentProfile(Object.assign({},studentForm,{email:email})):null});
   }
 
   async function handleBizAuth(){
     if(!email||!pw){props.show("Enter email and password","err");return;}
-    if(isNew&&(!name||!company)){props.show("Enter your name and company","err");return;}
+    if(isNew&&(!businessForm.company||!businessForm.firstName||!businessForm.lastName||!businessForm.phone||!businessForm.address||!businessForm.industry||!businessForm.companySize||!businessForm.about)){props.show("Complete all required employer fields","err");return;}
     setLoading(true);
     if(!sb){
-      props.onLogin({uid:"demo-biz",role:"business",name:company||"Houndstooth Coffee"});
+      props.onLogin({uid:"demo-biz",role:"business",name:businessForm.company||"Houndstooth Coffee",startNav:isNew?"profile":"overview",businessProfile:createBusinessProfile(Object.assign({},businessForm,{email:email}))});
       setLoading(false);return;
     }
     var res;
     if(isNew){
-      res=await dbSignUp(email,pw,"employer",{firstName:name.split(" ")[0],lastName:name.split(" ")[1]||"",company});
+      res=await dbSignUp(email,pw,"employer",Object.assign({},businessForm,{email:email}));
     } else {
       res=await dbSignIn(email,pw);
       if(res.role && res.role !== "employer"){
@@ -559,7 +702,7 @@ function LoginScreen(props){
     }
     setLoading(false);
     if(res.error){props.show(res.error==="not_connected"?"Add your Supabase keys to connect":res.error,"err");return;}
-    props.onLogin({uid:res.uid,role:"business",name:company||res.name});
+    props.onLogin({uid:res.uid,role:"business",name:businessForm.company||res.name,startNav:isNew?"profile":"overview",businessProfile:isNew?createBusinessProfile(Object.assign({},businessForm,{email:email})):null});
   }
 
   return(
@@ -599,10 +742,34 @@ function LoginScreen(props){
               <div onClick={function(){setIsNew(true);}} style={{flex:1,textAlign:"center",padding:"7px 0",borderRadius:8,background:isNew?SF:"transparent",color:isNew?"#fff":MU,fontSize:13,fontWeight:700,cursor:"pointer"}}>Create Account</div>
             </div>
             <div style={{display:"flex",flexDirection:"column",gap:11}}>
-              {isNew&&mode==="student"&&<div><Lbl t="FULL NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Your Full Name"/></div>}
-              {isNew&&mode==="student"&&<div><Lbl t="SCHOOL"/><Inp v={school} onChange={function(e){setSchool(e.target.value);}} ph="Skyline High School"/></div>}
-              {isNew&&mode==="business"&&<div><Lbl t="COMPANY NAME"/><Inp v={company} onChange={function(e){setCompany(e.target.value);}} ph="Houndstooth Coffee"/></div>}
-              {isNew&&mode==="business"&&<div><Lbl t="YOUR NAME"/><Inp v={name} onChange={function(e){setName(e.target.value);}} ph="Your Name"/></div>}
+              {isNew&&mode==="student"&&<>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
+                  <div><Lbl t="FIRST NAME"/><Inp v={studentForm.firstName} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{firstName:val});});}} ph="Alex"/></div>
+                  <div><Lbl t="LAST NAME"/><Inp v={studentForm.lastName} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{lastName:val});});}} ph="Johnson"/></div>
+                </div>
+                <div><Lbl t="SCHOOL"/><Inp v={studentForm.school} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{school:val});});}} ph="Skyline High School"/></div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
+                  <div><Lbl t="GRADE"/><Inp v={studentForm.grade} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{grade:val});});}} ph="11th Grade"/></div>
+                  <div><Lbl t="AGE"/><Inp v={studentForm.age} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{age:val});});}} ph="17"/></div>
+                </div>
+                <div><Lbl t="PHONE"/><Inp v={studentForm.phone} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{phone:val});});}} ph="(214) 555-0192"/></div>
+                <div><Lbl t="SHORT BIO"/><Txa v={studentForm.bio} onChange={function(e){var val=e.target.value;setStudentForm(function(p){return Object.assign({},p,{bio:val});});}} ph="Tell employers what kind of work you're looking for..." h={68}/></div>
+              </>}
+              {isNew&&mode==="business"&&<>
+                <div><Lbl t="COMPANY NAME"/><Inp v={businessForm.company} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{company:val});});}} ph="Houndstooth Coffee"/></div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
+                  <div><Lbl t="CONTACT FIRST NAME"/><Inp v={businessForm.firstName} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{firstName:val});});}} ph="Sarah"/></div>
+                  <div><Lbl t="CONTACT LAST NAME"/><Inp v={businessForm.lastName} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{lastName:val});});}} ph="Mitchell"/></div>
+                </div>
+                <div><Lbl t="PHONE"/><Inp v={businessForm.phone} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{phone:val});});}} ph="(214) 555-3377"/></div>
+                <div><Lbl t="ADDRESS"/><Inp v={businessForm.address} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{address:val});});}} ph="2817 Commerce St, Dallas TX"/></div>
+                <div><Lbl t="WEBSITE"/><Inp v={businessForm.website} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{website:val});});}} ph="houndstoothcoffee.com"/></div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
+                  <div><Lbl t="INDUSTRY"/><Inp v={businessForm.industry} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{industry:val});});}} ph="Food and Beverage"/></div>
+                  <div><Lbl t="COMPANY SIZE"/><Inp v={businessForm.companySize} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{companySize:val});});}} ph="11-50 employees"/></div>
+                </div>
+                <div><Lbl t="ABOUT THE BUSINESS"/><Txa v={businessForm.about} onChange={function(e){var val=e.target.value;setBusinessForm(function(p){return Object.assign({},p,{about:val});});}} ph="What should students know about your business?" h={68}/></div>
+              </>}
               <div><Lbl t="EMAIL"/><Inp v={email} onChange={function(e){setEmail(e.target.value);}} ph="you@email.com" tp="email"/></div>
               <div><Lbl t="PASSWORD"/><Inp v={pw} onChange={function(e){setPw(e.target.value);}} ph="password" tp="password"/></div>
             </div>
@@ -619,15 +786,15 @@ function LoginScreen(props){
 // STUDENT APP
 // ─────────────────────────────────────────────────────────────
 function StudentApp(props){
-  var [nav,setNav]=useState("jobs");
+  var [nav,setNav]=useState(props.initialNav||"jobs");
   var [selJob,setSelJob]=useState(null);
   var [jobs,setJobs]=useState(LOCAL_JOBS);
   var [apps,setApps]=useState(LOCAL_APPS);
   var [saved,setSaved]=useState([]);
   var [resume,setResume]=useState(null);
-  var [rd,setRd]=useState({firstName:"Alex",lastName:"Johnson",email:"alex.j@email.com",phone:"(214) 555-0192",school:"Skyline High School",grade:"11th Grade",gpa:"3.8",summary:"Motivated student seeking part-time work to build professional skills.",skills:["Customer Service","Microsoft Office","Canva"],activities:["Debate Club Captain","National Honor Society"],experience:[{role:"Volunteer",org:"Dallas Food Bank",dates:"Sep 2024-Present",desc:"Sorted donations for 200+ families per shift."}]});
+  var [rd,setRd]=useState(createResumeData(props.user&&props.user.studentProfile?props.user.studentProfile:{}));
   var [tmpl,setTmpl]=useState("classic");
-  var [prof,setProf]=useState({firstName:"Alex",lastName:"Johnson",email:"alex.j@email.com",phone:"(214) 555-0192",school:"Skyline High School",grade:"11th Grade",age:"17",bio:"Motivated student looking for part-time work in the Dallas area.",skills:["Customer Service","Microsoft Office","Canva"]});
+  var [prof,setProf]=useState(createStudentProfile(props.user&&props.user.studentProfile?props.user.studentProfile:{}));
   var [area,setArea]=useState(AREAS[0]);
   var [radius,setRadius]=useState(20);
   var [flt,setFlt]=useState("All");
@@ -646,6 +813,18 @@ function StudentApp(props){
   var [npsk,setNpsk]=useState("");
   var [loading,setLoading]=useState(false);
   var fileRef=useRef();
+
+  useEffect(function(){
+    if(props.initialNav) setNav(props.initialNav);
+  },[props.initialNav]);
+
+  useEffect(function(){
+    if(props.user&&props.user.studentProfile){
+      setProf(function(p){return Object.assign({}, p, props.user.studentProfile);});
+      setPd(function(p){return Object.assign({}, p, props.user.studentProfile);});
+      setRd(function(r){return Object.assign({}, r, createResumeData(props.user.studentProfile));});
+    }
+  },[props.user]);
 
   useEffect(function(){
     if(!props.user) return;
@@ -1190,7 +1369,7 @@ function StudentResumePage(props){
 // BUSINESS APP
 // ─────────────────────────────────────────────────────────────
 function BizApp(props){
-  var [nav,setNav]=useState("overview");
+  var [nav,setNav]=useState(props.initialNav||"overview");
   var [applicants,setApplicants]=useState(sb ? [] : LOCAL_APPLICANTS);
   var [fj,setFj]=useState("all");
   var [selA,setSelA]=useState(null);
@@ -1198,17 +1377,47 @@ function BizApp(props){
   var [showIV,setShowIV]=useState(false);
   var [ivDraft,setIvDraft]=useState({date:"",time:"",loc:"",notes:""});
   var [showAdd,setShowAdd]=useState(false);
+  var [editJobId,setEditJobId]=useState(null);
   var [myJobs,setMyJobs]=useState(sb ? [] : LOCAL_JOBS.filter(function(j){return BIZ_IDS.includes(j.id);}));
-  var [nj,setNj]=useState({title:"",type:"Part-Time",pay:"",loc:"",sched:"",train:"",desc:"",qs:[""]});
-  var [biz,setBiz]=useState({co:props.user?props.user.name:"Houndstooth Coffee",nm:"Sarah Mitchell",email:"sarah@houndstooth.com",phone:"(214) 555-3377",addr:"2817 Commerce St, Dallas TX",web:"houndstoothcoffee.com",ind:"Food and Beverage",size:"11-50 employees",about:"Specialty coffee shop committed to quality and community. We love giving first-time workers their start."});
+  var [nj,setNj]=useState(createEmptyJobDraft());
+  var [biz,setBiz]=useState(createBusinessProfile(props.user&&props.user.businessProfile?props.user.businessProfile:{company:props.user?props.user.name:""}));
   var [editB,setEditB]=useState(false);
   var [bd,setBd]=useState(Object.assign({},biz));
+
+  useEffect(function(){
+    if(props.initialNav) setNav(props.initialNav);
+  },[props.initialNav]);
+
+  useEffect(function(){
+    if(props.user&&props.user.businessProfile){
+      var nextBiz = createBusinessProfile(props.user.businessProfile);
+      setBiz(nextBiz);
+      setBd(Object.assign({}, nextBiz));
+    }
+  },[props.user]);
 
   // Load real data from Supabase when connected
   useEffect(function(){
     if(!sb||!props.user)return;
     dbLoadMyJobs(props.user.uid).then(function(data){
       if(Array.isArray(data)) setMyJobs(data.map(normalizeJob));
+    });
+    dbLoadEmployerProfile(props.user.uid).then(function(data){
+      if(!data) return;
+      var mapped = createBusinessProfile({
+        company: data.employer.company_name || props.user.name,
+        firstName: data.profile.first_name || splitName(data.employer.contact_name || "").firstName,
+        lastName: data.profile.last_name || splitName(data.employer.contact_name || "").lastName,
+        email: data.employer.email || data.profile.email || "",
+        phone: data.employer.phone || "",
+        address: data.employer.address || "",
+        website: data.employer.website || "",
+        industry: data.employer.industry || "",
+        companySize: data.employer.company_size || "",
+        about: data.employer.about || ""
+      });
+      setBiz(mapped);
+      setBd(Object.assign({}, mapped));
     });
     dbLoadApplicants(props.user.uid).then(function(data){
       if(Array.isArray(data)){
@@ -1255,14 +1464,44 @@ function BizApp(props){
     setShowIV(false);props.show("Interview scheduled! Scheduled");
   }
 
+  function openCreateJob(){
+    setEditJobId(null);
+    setNj(createEmptyJobDraft());
+    setShowAdd(true);
+  }
+
+  function openEditJob(job){
+    setEditJobId(job.id);
+    setNj(jobToDraft(job));
+    setShowAdd(true);
+  }
+
   async function addJob(){
-    if(!nj.title||!nj.pay){props.show("Title and pay required","err");return;}
-    var jobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:nj.qs.filter(function(q){return q.trim();}),spots:1,tags:[],is_active:true};
+    if(!nj.title||!nj.pay||!nj.desc){props.show("Title, pay, and description required","err");return;}
+    var cleanedQuestions=nj.qs.filter(function(q){return q.trim();});
+    var jobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:cleanedQuestions,spots:parseInt(nj.spots,10)||1,tags:[],is_active:true};
+    if(editJobId){
+      if(sb&&props.user){var updRes=await dbUpdateJob(props.user.uid,editJobId,jobData);if(updRes.error){props.show("Error: "+updRes.error,"err");return;}}
+      setMyJobs(function(p){return p.map(function(job){return String(job.id)===String(editJobId)?normalizeJob(Object.assign({},job,jobData,{loc:nj.loc,sched:nj.sched,train:nj.train,desc:nj.desc,qs:cleanedQuestions,co:biz.co})):job;});});
+      setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());
+      props.show("Job updated! Success");
+      return;
+    }
     if(sb&&props.user){var res=await dbPostJob(props.user.uid,jobData);if(res.error){props.show("Error: "+res.error,"err");return;}}
-    var localJob=Object.assign({},jobData,{id:Date.now(),co:biz.co,logo:<FaStar />,clr:"#F59E0B",loc:nj.loc,la:32.793,lo:-96.807,posted:"Today",qs:nj.qs.filter(function(q){return q.trim();})});
+    var localJob=Object.assign({},jobData,{id:Date.now(),co:biz.co,logo:<FaStar />,clr:"#F59E0B",loc:nj.loc,la:32.793,lo:-96.807,posted:"Today",qs:cleanedQuestions});
     setMyJobs(function(p){return p.concat([localJob]);});
-    setShowAdd(false);setNj({title:"",type:"Part-Time",pay:"",loc:"",sched:"",train:"",desc:"",qs:[""]});
+    setShowAdd(false);setNj(createEmptyJobDraft());
     props.show("Job posted! Success");
+  }
+
+  async function saveBizProfile(){
+    if(sb&&props.user){
+      var res = await dbSaveEmployerProfile(props.user.uid, bd);
+      if(res.error){props.show("Error: "+res.error,"err");return;}
+    }
+    setBiz(Object.assign({},bd));
+    setEditB(false);
+    props.show("Updated! Success");
   }
 
   var pend=applicants.filter(function(a){return a.status==="pending";}).length;
@@ -1289,7 +1528,7 @@ function BizApp(props){
             <p style={{color:MU,fontSize:11}}>{biz.co} - Employer Dashboard</p>
           </div>
           <div style={{display:"flex",gap:9,alignItems:"center"}}>
-            <Btn ch="+ Post New Job" v="or" sm sx={{background:OR,color:"#000"}} onClick={function(){setShowAdd(true);}}/>
+            <Btn ch="+ Post New Job" v="or" sm sx={{background:OR,color:"#000"}} onClick={openCreateJob}/>
             <span style={pill(OR)}><FaBriefcase style={{marginRight:4}}/> Employer</span>
           </div>
         </div>
@@ -1312,7 +1551,7 @@ function BizApp(props){
           </div>}
 
           {nav==="jobs"&&<div>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><p style={{color:MU,fontSize:13}}>{myJobs.length} listings for {biz.co}</p><Btn ch="+ Post New Job" v="or" sx={{background:OR,color:"#000"}} onClick={function(){setShowAdd(true);}}/></div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><p style={{color:MU,fontSize:13}}>{myJobs.length} listings for {biz.co}</p><Btn ch="+ Post New Job" v="or" sx={{background:OR,color:"#000"}} onClick={openCreateJob}/></div>
             <div style={{display:"flex",flexDirection:"column",gap:11}}>{myJobs.map(function(j){
               var a2=applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;});
               return <div key={j.id} style={bx({border:"1px solid "+j.clr+"33"})}>
@@ -1324,7 +1563,7 @@ function BizApp(props){
                     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
                       {[{l:"Applied",n:a2.length,c:BL},{l:"Pending",n:a2.filter(function(a){return a.status==="pending";}).length,c:WN},{l:"Open",n:j.spots||1,c:OR}].map(function(s){return <div key={s.l} style={{background:BG,borderRadius:9,padding:"8px 11px",border:"1px solid "+BR}}><p style={{color:s.c,fontFamily:FH,fontSize:18,fontWeight:800}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.l}</p></div>;})}
                     </div>
-                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/></div>
+                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/><Btn ch="Edit Post" v="gh" sm onClick={function(){openEditJob(j);}}/></div>
                   </div>
                 </div>
               </div>;
@@ -1381,7 +1620,7 @@ function BizApp(props){
             {editB?<div style={bx()}>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:9}}>{[["co","Company Name"],["nm","Your Name"],["email","Email"],["phone","Phone"],["addr","Address"],["web","Website"],["ind","Industry"],["size","Company Size"]].map(function(pair){return <div key={pair[0]}><Lbl t={pair[1].toUpperCase()}/><Inp v={bd[pair[0]]} onChange={function(e){var val=e.target.value;setBd(function(p){return Object.assign({},p,{[pair[0]]:val});});}}/></div>;})}</div>
               <div style={{marginBottom:14}}><Lbl t="ABOUT"/><Txa v={bd.about} onChange={function(e){var val=e.target.value;setBd(function(p){return Object.assign({},p,{about:val});});}} h={68}/></div>
-              <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg sx={{background:OR,color:"#000"}} onClick={function(){setBiz(Object.assign({},bd));setEditB(false);props.show("Updated! Success");}}/><Btn ch="Cancel" v="gh" onClick={function(){setEditB(false);}}/></div>
+              <div style={{display:"flex",gap:8}}><Btn ch="Save Changes" lg sx={{background:OR,color:"#000"}} onClick={saveBizProfile}/><Btn ch="Cancel" v="gh" onClick={function(){setEditB(false);}}/></div>
             </div>:<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:13}}>
               <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Contact and Details</h3>{[["Company",biz.co],["Contact",biz.nm],["Email",biz.email],["Phone",biz.phone],["Address",biz.addr],["Website",biz.web]].map(function(pair){return <div key={pair[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:10,fontWeight:700}}>{pair[0]}</p><p style={{color:"#fff",fontSize:12,fontWeight:600}}>{pair[1]}</p></div>;})}</div>
               <div style={bx()}><Lbl t="INDUSTRY"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.ind}</p><Lbl t="SIZE"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.size}</p><Lbl t="ABOUT"/><p style={{color:MU,fontSize:12,lineHeight:1.7,marginBottom:12}}>{biz.about}</p><div style={{background:OR+"11",border:"1px solid "+OR+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:OR,fontSize:11,fontWeight:800,marginBottom:2}}>Verified Employer</p><p style={{color:"#FED7AA",fontSize:11}}>Approved to post on LaunchDFW.</p></div></div>
@@ -1418,10 +1657,10 @@ function BizApp(props){
         </div>
       </Modal>}
 
-      {showAdd&&<Modal onClose={function(){setShowAdd(false);}}>
+      {showAdd&&<Modal onClose={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}>
         <div style={{padding:"14px 18px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-          <div><p style={{color:OR,fontSize:10,fontWeight:800,marginBottom:2}}>NEW JOB POST</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>Post a Job for {biz.co}</h2></div>
-          <Btn ch="X" v="gh" sm onClick={function(){setShowAdd(false);}}/>
+          <div><p style={{color:OR,fontSize:10,fontWeight:800,marginBottom:2}}>{editJobId?"EDIT JOB POST":"NEW JOB POST"}</p><h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff"}}>{editJobId?"Update":"Post a Job for"} {biz.co}</h2></div>
+          <Btn ch="X" v="gh" sm onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/>
         </div>
         <div style={{padding:"14px 18px 18px",maxHeight:"70vh",overflowY:"auto"}}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:9}}>
@@ -1431,13 +1670,14 @@ function BizApp(props){
             <div><Lbl t="LOCATION"/><Inp v={nj.loc} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{loc:val});});}} ph="e.g. Uptown Dallas"/></div>
             <div><Lbl t="SCHEDULE"/><Inp v={nj.sched} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{sched:val});});}} ph="e.g. Weekends"/></div>
             <div><Lbl t="TRAINING PROVIDED"/><Inp v={nj.train} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{train:val});});}} ph="e.g. Full training"/></div>
+            <div><Lbl t="OPEN SPOTS"/><Inp v={String(nj.spots||1)} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{spots:val});});}} ph="1" tp="number"/></div>
           </div>
           <div style={{marginBottom:12}}><Lbl t="DESCRIPTION (required)"/><Txa v={nj.desc} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{desc:val});});}} ph="Describe the role..." h={72}/></div>
           <div style={{marginBottom:14}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><Lbl t="CUSTOM QUESTIONS FOR APPLICANTS"/><Btn ch="+ Add" v="gh" sm onClick={function(){setNj(function(p){return Object.assign({},p,{qs:p.qs.concat([""])});});}}/></div>
             {nj.qs.map(function(q2,i){return <div key={i} style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}><span style={{width:18,height:18,borderRadius:5,background:BL+"22",border:"1px solid "+BL+"44",display:"flex",alignItems:"center",justifyContent:"center",color:BL,fontSize:9,fontWeight:800,flexShrink:0}}>Q{i+1}</span><Inp v={q2} onChange={function(e){var val=e.target.value;setNj(function(p){var qs2=p.qs.slice();qs2[i]=val;return Object.assign({},p,{qs:qs2});});}} ph={"Question "+(i+1)+"..."} sx={{flex:1}}/>{nj.qs.length>1&&<span className="hov" onClick={function(){setNj(function(p){return Object.assign({},p,{qs:p.qs.filter(function(_,j2){return j2!==i;})});});}} style={{color:DN,fontSize:16,cursor:"pointer",padding:4}}>x</span>}</div>;})}
           </div>
-          <div style={{display:"flex",gap:8}}><Btn ch="Post Job Listing" lg sx={{flex:1,justifyContent:"center",background:OR,color:"#000"}} onClick={addJob}/><Btn ch="Cancel" v="gh" onClick={function(){setShowAdd(false);}}/></div>
+          <div style={{display:"flex",gap:8}}><Btn ch={editJobId?"Save Job Changes":"Post Job Listing"} lg sx={{flex:1,justifyContent:"center",background:OR,color:"#000"}} onClick={addJob}/><Btn ch="Cancel" v="gh" onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/></div>
         </div>
       </Modal>}
     </div>
