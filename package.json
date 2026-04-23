@@ -1,5 +1,5 @@
 {
-  "name": "launchdfw",
+  "name": "job-spark",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@stripe/stripe-js": "^9.3.0",
     "@supabase/supabase-js": "^2.101.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

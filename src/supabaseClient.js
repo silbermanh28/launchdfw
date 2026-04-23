@@ -11,4 +11,4 @@ try {
   supabase = null
 }
 
-export { supabase }
+export { supabase, SUPABASE_URL, SUPABASE_ANON_KEY }

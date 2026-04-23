@@ -1,12 +1,15 @@
 import { useState, useRef, useEffect } from "react";
 import { FaUser, FaEnvelope, FaCheck, FaHeart, FaStar, FaFootballBall, FaPlane, FaMugHot, FaClipboard, FaHourglassHalf, FaTimes, FaCoffee, FaLaptop, FaFutbol, FaCamera, FaBook, FaBuilding, FaShoppingCart, FaPaw, FaSoap, FaUniversity, FaChartLine, FaPen, FaBasketballBall, FaDrumstickBite, FaHospital, FaShoppingBag, FaCar, FaFilm, FaLeaf, FaGraduationCap, FaExclamationTriangle, FaLock, FaDoorOpen, FaArrowLeft, FaHome, FaFileAlt, FaCalendar, FaUsers, FaBriefcase, FaMapMarker, FaQuestion, FaSearch, FaClock, FaStickyNote, FaLightbulb, FaMicrophone, FaTrophy, FaUpload, FaWrench, FaPalette, FaRegHeart, FaBell, FaCommentDots, FaPaperPlane, FaDownload, FaFlag, FaCheckCircle } from "react-icons/fa";
-import { supabase } from "./supabaseClient";
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from "./supabaseClient";
+import { PREMIUM_FEATURES, PREMIUM_TRIAL_DAYS, EMPLOYER_PREMIUM_PRICE, STUDENT_PREMIUM_PRICE, getFeatureMeta, getPremiumAccess, getRolePlanLabel, getRolePlanPrice, normalizePremiumProfileFields, sortJobsByPremium, toMoney } from "./premium";
 
 // ─────────────────────────────────────────────────────────────
 // SUPABASE SETUP
 // This creates the connection to Supabase using the bundled client.
 // ─────────────────────────────────────────────────────────────
 var sb = supabase;
+var APP_NAME = "Job Spark";
+var STORAGE_PREFIX = "jobspark";
 
 // ─────────────────────────────────────────────────────────────
 // SUPABASE HELPER FUNCTIONS
@@ -42,7 +45,6 @@ async function dbSignUp(email, password, role, extra) {
     var employerRes = await sb.from("employers").insert({
       id: uid,
       company_name: extra.company || "",
-      contact_name: buildFullName(extra.firstName, extra.lastName),
       email: email,
       phone: extra.phone || "",
       address: extra.address || "",
@@ -57,6 +59,31 @@ async function dbSignUp(email, password, role, extra) {
     if (employerRes.error) return { error: employerRes.error.message };
   }
   return { uid: uid, role: role };
+}
+
+function getMissingSchemaColumn(error) {
+  var message = error && (error.message || error.details || error.hint || "");
+  if (!message) return "";
+  var singleQuoteMatch = String(message).match(/'([^']+)' column/i);
+  if (singleQuoteMatch && singleQuoteMatch[1]) return singleQuoteMatch[1];
+  var doubleQuoteMatch = String(message).match(/column \"([^\"]+)\"/i);
+  if (doubleQuoteMatch && doubleQuoteMatch[1]) return doubleQuoteMatch[1];
+  return "";
+}
+
+async function runPayloadWithSchemaFallback(makeRequest, payload) {
+  var nextPayload = Object.assign({}, payload);
+  var seen = {};
+  while (true) {
+    var res = await makeRequest(nextPayload);
+    if (!res.error) return { result: res, payload: nextPayload };
+    var missingColumn = getMissingSchemaColumn(res.error);
+    if (!missingColumn || seen[missingColumn] || !(missingColumn in nextPayload)) {
+      return { result: res, payload: nextPayload };
+    }
+    seen[missingColumn] = true;
+    delete nextPayload[missingColumn];
+  }
 }
 
 async function dbSignIn(email, password) {
@@ -74,9 +101,10 @@ async function dbLoadJobs() {
   if (!sb) return null;
   var res = await sb.from("jobs").select("*").eq("is_active", true).order("posted_at", { ascending: false });
   if (res.error) { console.error(res.error); return null; }
-  var jobs = res.data || [];
+  var jobs = (res.data || []).filter(function(job){ return !isJobExpired(job); });
   var employerIds = Array.from(new Set(jobs.map(function(job){ return job.employer_id; }).filter(Boolean)));
   var employersById = {};
+  var employerProfilesById = {};
   if (employerIds.length > 0) {
     var employerRes = await sb.from("employers").select("id,verification_status,email_domain_match,verification_signal").in("id", employerIds);
     if (!employerRes.error && Array.isArray(employerRes.data)) {
@@ -86,15 +114,27 @@ async function dbLoadJobs() {
     } else if (employerRes.error) {
       console.warn("dbLoadJobs employers error", employerRes.error);
     }
+    var profileRes = await sb.from("profiles").select("id,premium_status,premium_expires_at,trial_ends_at").in("id", employerIds);
+    if (!profileRes.error && Array.isArray(profileRes.data)) {
+      profileRes.data.forEach(function(profile){
+        employerProfilesById[profile.id] = profile;
+      });
+    } else if (profileRes.error) {
+      console.warn("dbLoadJobs profiles error", profileRes.error);
+    }
   }
-  return jobs.map(function(job){
+  return sortJobsByPremium(jobs.map(function(job){
     var employer = employersById[job.employer_id] || {};
+    var employerProfile = employerProfilesById[job.employer_id] || {};
+    var premiumAccess = getPremiumAccess(normalizePremiumProfileFields(employerProfile), "business");
     return Object.assign({}, job, {
       verificationStatus: employer.verification_status || "pending",
       emailDomainMatch: !!employer.email_domain_match,
-      verificationSignal: employer.verification_signal || ""
+      verificationSignal: employer.verification_signal || "",
+      employerPremiumStatus: employerProfile.premium_status || "free",
+      isFeatured: premiumAccess.active
     });
-  });
+  }));
 }
 
 async function dbLoadMyApps(studentId) {
@@ -160,13 +200,23 @@ async function dbLoadSaved(studentId) {
 }
 
 async function dbUpdateProfile(studentId, fields) {
-  if (!sb) return;
-  await sb.from("students").update(fields).eq("id", studentId);
+  if (!sb) return { error: "not_connected" };
+  var payload = Object.assign({ id: studentId }, fields || {});
+  if (payload.firstName && !payload.first_name) payload.first_name = payload.firstName;
+  if (payload.lastName && !payload.last_name) payload.last_name = payload.lastName;
+  if (payload.bio && !payload.summary) payload.summary = payload.bio;
+  delete payload.firstName;
+  delete payload.lastName;
+  var wrapped = await runPayloadWithSchemaFallback(function(cleanPayload){
+    return sb.from("students").upsert(cleanPayload, { onConflict: "id" });
+  }, payload);
+  return wrapped.result.error ? { error: wrapped.result.error.message } : { ok: true };
 }
 
 async function dbSaveResumeData(studentId, resumeData) {
-  if (!sb) return;
-  await sb.from("students").update({
+  if (!sb) return { error: "not_connected" };
+  var payload = {
+    id: studentId,
     first_name: resumeData.firstName,
     last_name: resumeData.lastName,
     email: resumeData.email,
@@ -179,14 +229,19 @@ async function dbSaveResumeData(studentId, resumeData) {
     activities: resumeData.activities,
     experience: resumeData.experience,
     resume_url: resumeData.resumeUrl
-  }).eq("id", studentId);
+  };
+  var wrapped = await runPayloadWithSchemaFallback(function(cleanPayload){
+    return sb.from("students").upsert(cleanPayload, { onConflict: "id" });
+  }, payload);
+  return wrapped.result.error ? { error: wrapped.result.error.message } : { ok: true };
 }
 
 async function dbSaveProfile(studentId, profileData) {
   if (!sb) return { error: "not_connected" };
   const { error } = await sb.from("profiles").update({
     first_name: profileData.firstName,
-    last_name: profileData.lastName
+    last_name: profileData.lastName,
+    email: profileData.email || undefined
   }).eq("id", studentId);
   if (error) return { error: error.message };
   return {};
@@ -202,11 +257,175 @@ async function dbUploadResume(uid, file) {
   return { url: urlData.publicUrl };
 }
 
+async function dbInvoke(name, body) {
+  if (!sb) return { error: "not_connected" };
+  var payload = body || {};
+  var primaryError = null;
+  var functionUrl = SUPABASE_URL + "/functions/v1/" + name;
+
+  try {
+    var res = await sb.functions.invoke(name, { body: payload });
+    if (!res.error) return { data: res.data || {} };
+    primaryError = res.error;
+  } catch (err) {
+    primaryError = err;
+  }
+
+  try {
+    var sessionRes = await sb.auth.getSession();
+    var accessToken = sessionRes.data && sessionRes.data.session ? sessionRes.data.session.access_token : "";
+    if (!accessToken) {
+      return { error: "Your session expired. Please sign in again and retry." };
+    }
+    var response = await fetch(SUPABASE_URL + "/functions/v1/" + name, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: "Bearer " + accessToken
+      },
+      body: JSON.stringify(payload)
+    });
+    var data = await response.json().catch(function(){ return {}; });
+    if (!response.ok) {
+      return { error: data.error || data.message || ("Function request failed (" + response.status + ")") };
+    }
+    return { data: data || {} };
+  } catch (fallbackError) {
+    console.error("dbInvoke failed", { name: name, primaryError: primaryError, fallbackError: fallbackError });
+    var primaryMessage = primaryError && primaryError.message ? String(primaryError.message) : "";
+    var fallbackMessage = fallbackError && fallbackError.message ? String(fallbackError.message) : "";
+    var genericPrimary = !primaryMessage || /failed to send a request to the edge function/i.test(primaryMessage);
+    if (fallbackMessage) {
+      return { error: genericPrimary ? (fallbackMessage + " (" + functionUrl + ")") : (primaryMessage + " | Fallback: " + fallbackMessage) };
+    }
+    if (primaryMessage) {
+      return { error: genericPrimary ? ("Edge Function unreachable at " + functionUrl + ". Make sure the function is deployed and your Supabase project allows Edge Functions.") : primaryMessage };
+    }
+    return { error: "Function call failed" };
+  }
+}
+
+async function dbLoadPremiumProfile(uid) {
+  if (!sb || !uid) return null;
+  var res = await sb
+    .from("profiles")
+    .select("subscription_role,premium_status,premium_plan_key,premium_expires_at,trial_ends_at,stripe_customer_id,stripe_subscription_id,cancel_at_period_end")
+    .eq("id", uid)
+    .maybeSingle();
+  if (res.error) {
+    console.warn("dbLoadPremiumProfile error", res.error);
+    return null;
+  }
+  return normalizePremiumProfileFields(res.data || {});
+}
+
+async function dbStartCheckout(role, featureKey) {
+  return dbInvoke("create-checkout-session", { role: role, featureKey: featureKey });
+}
+
+async function dbOpenBillingPortal(role) {
+  return dbInvoke("create-billing-portal-session", { role: role });
+}
+
+async function dbRunResumeReview(studentId, resumeData, mode) {
+  return dbInvoke("ai-resume-review", {
+    studentId: studentId,
+    resumeData: resumeData,
+    mode: mode || "full"
+  });
+}
+
+async function dbRunJobMatches(studentId, jobs, profile) {
+  return dbInvoke("ai-job-match", {
+    studentId: studentId,
+    jobs: jobs,
+    profile: profile
+  });
+}
+
+async function dbLoadSavedJobMatches(studentId) {
+  if (!sb || !studentId) return [];
+  var res = await sb
+    .from("ai_job_match_scores")
+    .select("job_id,match_score,summary,strengths,gaps,updated_at")
+    .eq("student_id", studentId);
+  if (res.error) {
+    console.warn("dbLoadSavedJobMatches error", res.error);
+    return [];
+  }
+  return res.data || [];
+}
+
+async function dbStartInterviewCoach(studentId, jobId, applicationId) {
+  return dbInvoke("ai-interview-session", {
+    studentId: studentId,
+    jobId: jobId,
+    applicationId: applicationId
+  });
+}
+
+async function dbSubmitInterviewAnswerAi(sessionId, questionIndex, question, answerText, audioBase64) {
+  return dbInvoke("ai-interview-answer", {
+    sessionId: sessionId,
+    questionIndex: questionIndex,
+    question: question,
+    answerText: answerText,
+    audioBase64: audioBase64 || null
+  });
+}
+
+async function dbRefreshApplicantRankings(employerId, jobId) {
+  return dbInvoke("ai-applicant-rank", { employerId: employerId, jobId: jobId });
+}
+
+async function dbLoadApplicantRankings(jobIds) {
+  if (!sb || !Array.isArray(jobIds) || jobIds.length === 0) return [];
+  var res = await sb
+    .from("ai_applicant_rankings")
+    .select("job_id,application_id,match_score,rank_position,summary_reason,strengths,concerns,updated_at")
+    .in("job_id", jobIds);
+  if (res.error) {
+    console.warn("dbLoadApplicantRankings error", res.error);
+    return [];
+  }
+  return res.data || [];
+}
+
+async function dbGenerateJobDraft(employerId, roughNotes, draft) {
+  return dbInvoke("ai-job-writer", {
+    employerId: employerId,
+    roughNotes: roughNotes,
+    draft: draft
+  });
+}
+
+async function dbSuggestAiQuestions(employerId, draft) {
+  return dbInvoke("ai-screening-questions", {
+    employerId: employerId,
+    draft: draft
+  });
+}
+
+async function dbLoadAnalytics(employerId) {
+  if (!sb || !employerId) return [];
+  var res = await sb
+    .from("job_analytics_daily")
+    .select("*")
+    .eq("employer_id", employerId)
+    .order("metric_date", { ascending: false });
+  if (res.error) {
+    console.warn("dbLoadAnalytics error", res.error);
+    return [];
+  }
+  return res.data || [];
+}
+
 // Employer functions
 async function dbLoadMyJobs(employerId) {
   if (!sb) return null;
   var res = await sb.from("jobs").select("*").eq("employer_id", employerId).eq("is_active", true);
-  return res.error ? null : res.data;
+  return res.error ? null : (res.data || []).filter(function(job){ return !isJobExpired(job); });
 }
 
 async function dbPostJob(employerId, job) {
@@ -229,7 +448,7 @@ async function dbDeleteJob(employerId, jobId) {
 
 async function dbLoadEmployerProfile(employerId) {
   if (!sb) return null;
-  var profileRes = await sb.from("profiles").select("first_name,last_name,email").eq("id", employerId).maybeSingle();
+  var profileRes = await sb.from("profiles").select("first_name,last_name,email,subscription_role,premium_status,premium_plan_key,premium_expires_at,trial_ends_at,stripe_customer_id,stripe_subscription_id,cancel_at_period_end").eq("id", employerId).maybeSingle();
   var employerRes = await sb.from("employers").select("*").eq("id", employerId).maybeSingle();
   if (profileRes.error && employerRes.error) return null;
   return {
@@ -250,9 +469,9 @@ async function dbSaveEmployerProfile(employerId, bizData) {
   }).eq("id", employerId);
   if (profileRes.error) return { error: profileRes.error.message };
 
-  var employerRes = await sb.from("employers").update({
+  var employerPayload = {
+    id: employerId,
     company_name: normalizedBiz.co,
-    contact_name: normalizedBiz.nm,
     email: normalizedBiz.email,
     phone: normalizedBiz.phone,
     address: normalizedBiz.addr,
@@ -263,8 +482,11 @@ async function dbSaveEmployerProfile(employerId, bizData) {
     verification_status: verificationMeta.status,
     email_domain_match: verificationMeta.emailDomainMatch,
     verification_signal: verificationMeta.verificationSignal
-  }).eq("id", employerId);
-  if (employerRes.error) return { error: employerRes.error.message };
+  };
+  var wrapped = await runPayloadWithSchemaFallback(function(cleanPayload){
+    return sb.from("employers").upsert(cleanPayload, { onConflict: "id" });
+  }, employerPayload);
+  if (wrapped.result.error) return { error: wrapped.result.error.message };
   return { ok: true };
 }
 
@@ -449,6 +671,56 @@ function getEmployerVerificationMetadata(email, website, currentStatus) {
   };
 }
 
+function createPremiumFields(extra) {
+  return normalizePremiumProfileFields({
+    subscription_role: extra.subscriptionRole || extra.subscription_role || "",
+    premium_status: extra.premiumStatus || extra.premium_status || "free",
+    premium_plan_key: extra.premiumPlanKey || extra.premium_plan_key || "",
+    premium_expires_at: extra.premiumExpiresAt || extra.premium_expires_at || "",
+    trial_ends_at: extra.trialEndsAt || extra.trial_ends_at || "",
+    stripe_customer_id: extra.stripeCustomerId || extra.stripe_customer_id || "",
+    stripe_subscription_id: extra.stripeSubscriptionId || extra.stripe_subscription_id || "",
+    cancel_at_period_end: extra.cancelAtPeriodEnd != null ? extra.cancelAtPeriodEnd : extra.cancel_at_period_end
+  });
+}
+
+function getBillingQueryStatus() {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get("billing") || "";
+}
+
+function clearBillingQueryStatus() {
+  if (typeof window === "undefined") return;
+  var url = new URL(window.location.href);
+  if (!url.searchParams.has("billing")) return;
+  url.searchParams.delete("billing");
+  var nextUrl = url.pathname + (url.search ? url.search : "") + (url.hash || "");
+  window.history.replaceState({}, "", nextUrl);
+}
+
+function wait(ms) {
+  return new Promise(function(resolve){ setTimeout(resolve, ms); });
+}
+
+async function syncPremiumProfileAfterCheckout(uid, role, applyProfile) {
+  for (var attempt = 0; attempt < 6; attempt += 1) {
+    var profile = await dbLoadPremiumProfile(uid);
+    if (profile) {
+      applyProfile(profile);
+      if (getPremiumAccess(profile, role).active) {
+        return { ok: true, profile: profile };
+      }
+    }
+    if (attempt < 5) await wait(1500);
+  }
+  return { ok: false };
+}
+
+function getPremiumBadgeStyle(access, role) {
+  if (access.active) return { text: access.isTrial ? "Premium Trial" : "Premium Active", color: "#FBBF24", bg: "rgba(251,191,36,0.12)" };
+  return { text: role === "business" ? "Free Employer" : "Free Student", color: MU, bg: "rgba(255,255,255,0.05)" };
+}
+
 function normalizeAppRole(role) {
   if (role === "employer") return "business";
   if (role === "business" || role === "student") return role;
@@ -456,39 +728,39 @@ function normalizeAppRole(role) {
 }
 
 function createStudentProfile(extra) {
-  return {
-    firstName: extra.firstName || "Alex",
-    lastName: extra.lastName || "Johnson",
-    email: extra.email || "alex.j@email.com",
-    phone: extra.phone || "(214) 555-0192",
-    school: extra.school || "Skyline High School",
-    grade: extra.grade || "11th Grade",
-    age: extra.age || "17",
-    bio: extra.bio || "Motivated student looking for part-time work in the Dallas area.",
-    skills: Array.isArray(extra.skills) ? extra.skills : ["Customer Service", "Microsoft Office", "Canva"]
-  };
+  return Object.assign({
+    firstName: extra.firstName || "",
+    lastName: extra.lastName || "",
+    email: extra.email || "",
+    phone: extra.phone || "",
+    school: extra.school || "",
+    grade: extra.grade || "",
+    age: extra.age || "",
+    bio: extra.bio || "",
+    skills: Array.isArray(extra.skills) ? extra.skills : []
+  }, createPremiumFields(extra));
 }
 
 function createResumeData(extra) {
   return {
-    firstName: extra.firstName || "Alex",
-    lastName: extra.lastName || "Johnson",
-    email: extra.email || "alex.j@email.com",
-    phone: extra.phone || "(214) 555-0192",
-    school: extra.school || "Skyline High School",
-    grade: extra.grade || "11th Grade",
-    gpa: extra.gpa || "3.8",
-    summary: extra.summary || extra.bio || "Motivated student seeking part-time work to build professional skills.",
-    skills: Array.isArray(extra.skills) ? extra.skills : ["Customer Service", "Microsoft Office", "Canva"],
-    activities: Array.isArray(extra.activities) ? extra.activities : ["Debate Club Captain", "National Honor Society"],
-    experience: Array.isArray(extra.experience) && extra.experience.length ? extra.experience : [{role:"Volunteer",org:"Dallas Food Bank",dates:"Sep 2024-Present",desc:"Sorted donations for 200+ families per shift."}],
+    firstName: extra.firstName || "",
+    lastName: extra.lastName || "",
+    email: extra.email || "",
+    phone: extra.phone || "",
+    school: extra.school || "",
+    grade: extra.grade || "",
+    gpa: extra.gpa || "",
+    summary: extra.summary || extra.bio || "",
+    skills: Array.isArray(extra.skills) ? extra.skills : [],
+    activities: Array.isArray(extra.activities) ? extra.activities : [],
+    experience: Array.isArray(extra.experience) && extra.experience.length ? extra.experience : [],
     resumeUrl: extra.resumeUrl || ""
   };
 }
 
 function createBusinessProfile(extra) {
   var nameParts = extra.nm ? splitName(extra.nm) : { firstName: extra.firstName || "", lastName: extra.lastName || "" };
-  return {
+  return Object.assign({
     co: extra.co || extra.company || "",
     nm: extra.nm || buildFullName(nameParts.firstName, nameParts.lastName) || "",
     email: extra.email || "",
@@ -501,11 +773,11 @@ function createBusinessProfile(extra) {
     verificationStatus: extra.verificationStatus || extra.verification_status || "pending",
     emailDomainMatch: extra.emailDomainMatch != null ? !!extra.emailDomainMatch : !!extra.email_domain_match,
     verificationSignal: extra.verificationSignal || extra.verification_signal || ""
-  };
+  }, createPremiumFields(extra));
 }
 
 function createEmptyJobDraft() {
-  return { title:"", type:"Part-Time", pay:"", loc:"", sched:"", train:"", desc:"", qs:[""], spots:1, tags:[], areaLabel:"Select area..." };
+  return { title:"", type:"Part-Time", pay:"", loc:"", sched:"", train:"", desc:"", qs:[""], spots:1, tags:[], areaLabel:"Select area...", applicationDeadline:"" };
 }
 
 function jobToDraft(job) {
@@ -520,7 +792,8 @@ function jobToDraft(job) {
     qs: parseJobQuestions(job.qs || job.questions).length ? parseJobQuestions(job.qs || job.questions) : [""],
     spots: job.spots || 1,
     tags: Array.isArray(job.tags) ? job.tags : [],
-    areaLabel: job.areaLabel || job.area_label || inferAreaLabelFromJob(job)
+    areaLabel: job.areaLabel || job.area_label || inferAreaLabelFromJob(job),
+    applicationDeadline: toDateInputValue(job.applicationDeadline || job.application_deadline || job.deadline)
   };
 }
 
@@ -553,6 +826,7 @@ function getJobCoordinates(job) {
 function normalizeJob(job) {
   if (!job) return job;
   var coords = getJobCoordinates(job);
+  var applicationDeadline = job.applicationDeadline || job.application_deadline || job.deadline || "";
   return Object.assign({}, job, {
     co: job.co || job.company_name || job.company || "Employer",
     employerOwnerId: job.employerOwnerId || job.employer_id || null,
@@ -567,7 +841,10 @@ function normalizeJob(job) {
     areaLabel: job.areaLabel || job.area_label || inferAreaLabelFromJob(job),
     spots: parseInt(job.spots, 10) || 1,
     tags: Array.isArray(job.tags) ? job.tags : [],
-    qs: parseJobQuestions(job.qs || job.questions)
+    qs: parseJobQuestions(job.qs || job.questions),
+    isFeatured: !!job.isFeatured,
+    applicationDeadline: applicationDeadline,
+    deadline: applicationDeadline
   });
 }
 
@@ -595,8 +872,9 @@ var JOB_FILTER_TAGS = ["No Exp","16+","18+","College","STEM","Creative","Healthc
 
 var EX_DATA = {firstName:"Morgan",lastName:"Taylor",email:"morgan.taylor@gmail.com",phone:"(214) 555-8834",school:"Jesuit College Prep",grade:"12th Grade",gpa:"3.9",summary:"Detail-oriented senior with leadership experience. Starting UT Austin Fall 2026.",skills:["Customer Service","Excel","Canva","Public Speaking","Bilingual Spanish"],activities:["Student Council President","National Honor Society VP","Varsity Cross Country Captain"],experience:[{role:"Sales Associate",org:"Barnes and Noble",dates:"Aug 2024-Present",desc:"Assisted customers, ran POS system. Employee of the Month Dec 2024."},{role:"Camp Counselor",org:"City of Dallas",dates:"Jun-Aug 2024",desc:"Led STEM activities for 25 campers with a team of 6 counselors."},{role:"Tutor",org:"Schoolhouse.world",dates:"Sep 2023-Present",desc:"Helped 4 students improve from C to A in math and English."}]};
 
-var SHARED_STORE_KEY = "launchdfw_shared_state_v4";
-var SHARED_EVENT = "launchdfw-shared-updated";
+var SHARED_STORE_KEY = STORAGE_PREFIX + "_shared_state_v5";
+var LEGACY_SHARED_STORE_KEY = "launchdfw_shared_state_v4";
+var SHARED_EVENT = STORAGE_PREFIX + "-shared-updated";
 
 function formatShortDateTime(date) {
   return new Date(date).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
@@ -624,10 +902,45 @@ function getDefaultDeadline(jobId) {
   return base.toISOString();
 }
 
+function toDeadlineIso(value) {
+  if (!value) return "";
+  if (String(value).includes("T")) {
+    var dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? "" : dt.toISOString();
+  }
+  var endOfDay = new Date(value + "T23:59:59");
+  return Number.isNaN(endOfDay.getTime()) ? "" : endOfDay.toISOString();
+}
+
+function toDateInputValue(value) {
+  if (!value) return "";
+  var date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  var year = date.getFullYear();
+  var month = String(date.getMonth() + 1).padStart(2, "0");
+  var day = String(date.getDate()).padStart(2, "0");
+  return year + "-" + month + "-" + day;
+}
+
 function getDaysUntil(dateValue) {
   var now = new Date();
   var then = new Date(dateValue);
   return Math.ceil((then - now) / 86400000);
+}
+
+function formatDeadline(dateValue) {
+  if (!dateValue) return "No deadline";
+  var date = new Date(dateValue);
+  if (Number.isNaN(date.getTime())) return "No deadline";
+  return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function isJobExpired(job) {
+  var deadline = job && (job.applicationDeadline || job.application_deadline || job.deadline);
+  if (!deadline) return false;
+  var deadlineDate = new Date(deadline);
+  if (Number.isNaN(deadlineDate.getTime())) return false;
+  return deadlineDate.getTime() < Date.now();
 }
 
 function getEmployerVerificationStatus() {
@@ -651,13 +964,14 @@ function createSharedState() {
     notifications: [],
     onboardingSeen: {},
     savedDeadlineAlerts: {},
-    employerProfiles: {}
+    employerProfiles: {},
+    studentProfiles: {}
   };
 }
 
 function readSharedState() {
   if (typeof window === "undefined") return createSharedState();
-  var stored = safeParseJson(localStorage.getItem(SHARED_STORE_KEY), null);
+  var stored = safeParseJson(localStorage.getItem(SHARED_STORE_KEY) || localStorage.getItem(LEGACY_SHARED_STORE_KEY), null);
   if (!stored || typeof stored !== "object") {
     stored = createSharedState();
     localStorage.setItem(SHARED_STORE_KEY, JSON.stringify(stored));
@@ -672,6 +986,22 @@ function readSharedState() {
     });
   }
   return Object.assign(createSharedState(), stored);
+}
+
+function getSavedJobsKey(userId) {
+  return STORAGE_PREFIX + "_saved_jobs_" + userId;
+}
+
+function getLegacySavedJobsKey(userId) {
+  return "launchdfw_saved_jobs_" + userId;
+}
+
+function getOnboardingKey(userId) {
+  return STORAGE_PREFIX + "_onboarding_seen_" + userId;
+}
+
+function getLegacyOnboardingKey(userId) {
+  return "launchdfw_onboarding_seen_" + userId;
 }
 
 function writeSharedState(state) {
@@ -706,18 +1036,16 @@ function applySharedJobs(baseJobs, includeCustomJobs) {
   var withOverrides = baseJobs.map(function(job) {
     var override = state.jobOverrides[job.id] || {};
     return normalizeJob(Object.assign({}, job, override, {
-      verificationStatus: override.verificationStatus || job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer"),
-      deadline: override.deadline || job.deadline || getDefaultDeadline(job.id)
+      verificationStatus: override.verificationStatus || job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer")
     }));
-  });
+  }).filter(function(job){ return !isJobExpired(job); });
   var customJobs = includeCustomJobs ? (state.customJobs || []).map(function(job) {
     return normalizeJob(Object.assign({}, job, {
-      verificationStatus: job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer"),
-      deadline: job.deadline || getDefaultDeadline(job.id)
+      verificationStatus: job.verificationStatus || getEmployerVerificationStatus(job.co || job.company_name || job.company || "Employer")
     }));
-  }) : [];
+  }).filter(function(job){ return !isJobExpired(job); }) : [];
   var baseIds = withOverrides.map(function(job){ return String(job.id); });
-  return withOverrides.concat(customJobs.filter(function(job){ return !baseIds.includes(String(job.id)); }));
+  return sortJobsByPremium(withOverrides.concat(customJobs.filter(function(job){ return !baseIds.includes(String(job.id)); })));
 }
 
 function getSharedApplicationsForStudent(studentId) {
@@ -920,6 +1248,111 @@ function Modal(props){
   );
 }
 
+function PremiumBadge(props) {
+  var access = getPremiumAccess(props.profile || {}, props.role);
+  var badge = getPremiumBadgeStyle(access, props.role);
+  return <span style={pill(badge.color, badge.bg)}><FaStar style={{marginRight:4}} /> {badge.text}</span>;
+}
+
+function PaywallModal(props) {
+  var feature = getFeatureMeta(props.featureKey);
+  if (!feature) return null;
+  var role = props.role === "business" ? "business" : "student";
+  var price = toMoney(getRolePlanPrice(role));
+  return (
+    <Modal onClose={props.onClose} w={520}>
+      <div style={{padding:"18px 20px",borderBottom:"1px solid "+BR,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div>
+          <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1}}>PREMIUM FEATURE</p>
+          <h2 style={{fontFamily:FH,fontSize:18,fontWeight:800,color:"#fff"}}>{feature.title}</h2>
+        </div>
+        <Btn ch="Close" v="subtle" sm onClick={props.onClose}/>
+      </div>
+      <div style={{padding:"18px 20px 20px"}}>
+        <div style={{background:"linear-gradient(135deg,rgba(251,191,36,0.12),rgba(255,107,53,0.08))",border:"1px solid rgba(251,191,36,0.25)",borderRadius:16,padding:16,marginBottom:16}}>
+          <p style={{color:"#fff",fontSize:14,fontWeight:700,marginBottom:6}}>{feature.summary}</p>
+          <p style={{color:"#FDE68A",fontSize:12,lineHeight:1.7}}>
+            Start a {PREMIUM_TRIAL_DAYS}-day free trial, then continue for {price}/month. You can manage or cancel anytime from Billing.
+          </p>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:18}}>
+          <div style={bx({padding:14})}>
+            <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:4}}>INCLUDED</p>
+            <p style={{color:"#fff",fontSize:13,fontWeight:700,marginBottom:6}}>{getRolePlanLabel(role)}</p>
+            <p style={{color:MU,fontSize:12,lineHeight:1.6}}>Unlock AI tools, billing controls, and premium visibility benefits without leaving the app.</p>
+          </div>
+          <div style={bx({padding:14})}>
+            <p style={{color:PR,fontSize:11,fontWeight:800,marginBottom:4}}>SMOOTH UPGRADE</p>
+            <p style={{color:"#fff",fontSize:13,fontWeight:700,marginBottom:6}}>No dead ends</p>
+            <p style={{color:MU,fontSize:12,lineHeight:1.6}}>Free users can browse normally, then upgrade the moment they want this feature.</p>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:9}}>
+          <Btn ch={"Start " + PREMIUM_TRIAL_DAYS + "-Day Free Trial"} lg sx={{flex:1,justifyContent:"center",background:"#FBBF24",color:"#111"}} onClick={props.onUpgrade}/>
+          <Btn ch="Maybe Later" v="subtle" onClick={props.onClose}/>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function BillingPanel(props) {
+  var access = getPremiumAccess(props.profile || {}, props.role);
+  var badge = getPremiumBadgeStyle(access, props.role);
+  var canManageBilling = !!access.stripeCustomerId;
+  return (
+    <div style={{maxWidth:760}}>
+      <div style={bx({marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"})}>
+        <div>
+          <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1}}>BILLING</p>
+          <h2 style={{fontFamily:FH,fontSize:19,fontWeight:800,color:"#fff",marginBottom:4}}>{getRolePlanLabel(props.role)}</h2>
+          <p style={{color:MU,fontSize:12}}>Stripe manages checkout, renewals, and cancellation. Supabase mirrors your current entitlement state.</p>
+        </div>
+        <span style={pill(badge.color, badge.bg)}>{badge.text}</span>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12,marginBottom:14}}>
+        {[["Status",access.statusLabel],["Price",access.planPriceLabel],["Trial Ends",access.trialEndsLabel],["Access Until",access.expiresLabel]].map(function(pair){
+          return <div key={pair[0]} style={bx({padding:14})}><p style={{color:MU,fontSize:10,fontWeight:700,marginBottom:3}}>{pair[0].toUpperCase()}</p><p style={{color:"#fff",fontSize:13,fontWeight:700}}>{pair[1]}</p></div>;
+        })}
+      </div>
+      <div style={bx()}>
+        <p style={{color:"#fff",fontWeight:800,fontSize:13,marginBottom:8}}>What premium unlocks</p>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:14}}>
+          {Object.keys(PREMIUM_FEATURES).filter(function(key){ return PREMIUM_FEATURES[key].role === props.role; }).map(function(key){
+            return <span key={key} style={pill("#FBBF24","rgba(251,191,36,0.12)")}>{PREMIUM_FEATURES[key].title}</span>;
+          })}
+        </div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {!access.active && <Btn ch={"Upgrade for " + access.planPriceLabel} lg sx={{background:"#FBBF24",color:"#111"}} onClick={props.onUpgrade}/>}
+          {canManageBilling && <Btn ch="Manage Billing" v="subtle" onClick={props.onManage}/>}
+        </div>
+        {!canManageBilling && <p style={{color:MU,fontSize:12,marginTop:10}}>The billing portal appears after your first Stripe checkout creates a customer record.</p>}
+      </div>
+    </div>
+  );
+}
+
+function SimpleBarChart(props) {
+  var items = Array.isArray(props.items) ? props.items : [];
+  var max = items.reduce(function(acc, item){ return Math.max(acc, item.value || 0); }, 1);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {items.map(function(item){
+        var width = max ? Math.max(8, Math.round(((item.value || 0) / max) * 100)) : 0;
+        return <div key={item.label}>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:4}}>
+            <span style={{color:"#fff"}}>{item.label}</span>
+            <span style={{color:MU}}>{item.value}</span>
+          </div>
+          <div style={{height:8,borderRadius:999,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+            <div style={{width:width+"%",height:"100%",background:props.color || PR,borderRadius:999}} />
+          </div>
+        </div>;
+      })}
+    </div>
+  );
+}
+
 function HeaderBell(props){
   var unread = props.notifications.filter(function(note){ return !note.read; }).length;
   var bellRef = useRef(null);
@@ -1000,7 +1433,7 @@ function Sidebar(props){
     <div style={{width:210,background:SF,borderRight:"1px solid "+BR,display:"flex",flexDirection:"column",position:"sticky",top:0,height:"100vh",flexShrink:0}}>
       <div style={{padding:"16px 14px 12px",borderBottom:"1px solid "+BR,display:"flex",alignItems:"center",gap:9}}>
         <div style={{width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,"+props.ac+","+( props.ac===PR?"#0055FF":"#FF3B80")+")",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,color:"#000",fontWeight:800}}>{props.ac===PR?<FaStar size={16} />:<FaBriefcase size={16} />}</div>
-        <div><p style={{fontFamily:FH,fontWeight:800,fontSize:13,color:"#fff"}}>LaunchDFW</p><p style={{color:MU,fontSize:10}}>{props.ac===PR?"Student Portal":"Employer Portal"}</p></div>
+        <div><p style={{fontFamily:FH,fontWeight:800,fontSize:13,color:"#fff"}}>{APP_NAME}</p><p style={{color:MU,fontSize:10}}>{props.ac===PR?"Student Portal":"Employer Portal"}</p></div>
       </div>
       <nav style={{flex:1,padding:9,overflowY:"auto"}}>
         {props.items.map(function(it){
@@ -1139,7 +1572,7 @@ function LoginScreen(props){
     setLoading(true);
     if(!sb){
       // Demo mode - no real auth
-      props.onLogin({uid:"demo-student",role:"student",name:buildFullName(studentForm.firstName, studentForm.lastName)||"Alex Johnson",startNav:isNew?"profile":"jobs",studentProfile:createStudentProfile(Object.assign({},studentForm,{email:email}))});
+      props.onLogin({uid:"demo-student",role:"student",name:buildFullName(studentForm.firstName, studentForm.lastName) || splitName(email.split("@")[0].replace(/[._-]+/g, " ")).firstName || "Student",startNav:isNew?"profile":"jobs",studentProfile:createStudentProfile(Object.assign({},studentForm,{email:email}))});
       setLoading(false);return;
     }
     var res;
@@ -1186,7 +1619,7 @@ function LoginScreen(props){
       <div style={{position:"absolute",inset:0,background:"radial-gradient(ellipse 80% 50% at 50% 0%,rgba(0,200,150,0.1),transparent 60%)",pointerEvents:"none"}}/>
       <div style={{textAlign:"center",marginBottom:32,position:"relative"}}>
         <div style={{width:60,height:60,borderRadius:18,background:"linear-gradient(135deg,"+PR+",#0055FF)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px",boxShadow:"0 0 36px "+PR+"44"}}><FaStar size={28} color="#fff" /></div>
-        <h1 style={{fontFamily:FH,fontSize:32,fontWeight:800,color:"#fff"}}>LaunchDFW</h1>
+        <h1 style={{fontFamily:FH,fontSize:32,fontWeight:800,color:"#fff"}}>{APP_NAME}</h1>
         <p style={{color:MU,fontSize:13,marginTop:4}}>Safe student employment - Dallas Metroplex</p>
         {!sb&&<p style={{color:WN,fontSize:11,marginTop:6,background:WN+"11",border:"1px solid "+WN+"33",borderRadius:8,padding:"4px 12px",display:"inline-block"}}><FaExclamationTriangle /> Demo mode - Supabase not connected yet</p>}
       </div>
@@ -1293,9 +1726,16 @@ function StudentApp(props){
   var [walkthroughOpen,setWalkthroughOpen]=useState(false);
   var [walkStep,setWalkStep]=useState(0);
   var [sharedTick,setSharedTick]=useState(0);
+  var [premiumProfile,setPremiumProfile]=useState(createPremiumFields(props.user||{}));
+  var [paywallFeature,setPaywallFeature]=useState(null);
+  var [jobMatchScores,setJobMatchScores]=useState({});
+  var [resumeReview,setResumeReview]=useState(null);
+  var [resumeScoreLoading,setResumeScoreLoading]=useState(false);
+  var [interviewSession,setInterviewSession]=useState(null);
   var fileRef=useRef();
   var sharedState = readSharedState();
   var notifications = (sharedState.notifications || []).filter(function(note){ return note.userId===props.user?.uid && note.role==="student"; });
+  var premiumAccess = getPremiumAccess(Object.assign({}, prof, premiumProfile), "student");
 
   useEffect(function(){
     if(props.initialNav) setNav(props.initialNav);
@@ -1310,14 +1750,23 @@ function StudentApp(props){
       setProf(function(p){return Object.assign({}, p, props.user.studentProfile);});
       setPd(function(p){return Object.assign({}, p, props.user.studentProfile);});
       setRd(function(r){return Object.assign({}, r, createResumeData(props.user.studentProfile));});
+      setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(props.user.studentProfile)); });
     }
   },[props.user]);
 
   useEffect(function(){
+    if(!props.user || !sb) return;
+    dbLoadPremiumProfile(props.user.uid).then(function(data){
+      if(data) setPremiumProfile(function(prev){ return Object.assign({}, prev, data); });
+    });
+  },[props.user, sharedTick]);
+
+  useEffect(function(){
     if(!props.user) return;
-    var key = "launchdfw_saved_jobs_" + props.user.uid;
+    var key = getSavedJobsKey(props.user.uid);
+    var legacyKey = getLegacySavedJobsKey(props.user.uid);
     var stored = [];
-    try{ stored = JSON.parse(localStorage.getItem(key) || "[]"); }catch{ void 0; }
+    try{ stored = JSON.parse(localStorage.getItem(key) || localStorage.getItem(legacyKey) || "[]"); }catch{ void 0; }
     if(!Array.isArray(stored)) stored = [];
     setSaved(stored);
 
@@ -1332,7 +1781,7 @@ function StudentApp(props){
 
   useEffect(function(){
     if(!props.user) return;
-    var key = "launchdfw_saved_jobs_" + props.user.uid;
+    var key = getSavedJobsKey(props.user.uid);
     try{ localStorage.setItem(key, JSON.stringify(saved)); }catch{ void 0; }
   },[saved, props.user]);
 
@@ -1347,8 +1796,8 @@ function StudentApp(props){
 
   useEffect(function(){
     if(!props.user) return;
-    var walkthroughKey = "launchdfw_onboarding_seen_" + props.user.uid;
-    if(!localStorage.getItem(walkthroughKey)) {
+    var walkthroughKey = getOnboardingKey(props.user.uid);
+    if(!localStorage.getItem(walkthroughKey) && !localStorage.getItem(getLegacyOnboardingKey(props.user.uid))) {
       setWalkthroughOpen(true);
       setWalkStep(0);
     }
@@ -1359,7 +1808,8 @@ function StudentApp(props){
     saved.forEach(function(jobId){
       var job = jobs.find(function(entry){ return entry.id===jobId; });
       if(!job) return;
-      var days = getDaysUntil(job.deadline || getDefaultDeadline(job.id));
+      if(!job.applicationDeadline) return;
+      var days = getDaysUntil(job.applicationDeadline);
       var flagKey = props.user.uid + "-" + job.id;
       if(days <= 2 && days >= 0 && !sharedState.savedDeadlineAlerts[flagKey]){
         addNotification({
@@ -1404,34 +1854,36 @@ function StudentApp(props){
       setApps(mapped);
     });
     // Load profile data from profiles table
-    sb.from("profiles").select("first_name,last_name").eq("id", props.user.uid).maybeSingle().then(function(pdata){
+    sb.from("profiles").select("first_name,last_name,subscription_role,premium_status,premium_plan_key,premium_expires_at,trial_ends_at,stripe_customer_id,stripe_subscription_id,cancel_at_period_end").eq("id", props.user.uid).maybeSingle().then(function(pdata){
       // Load student data from students table
-      sb.from("students").select("email,phone,school,grade,gpa,summary,skills,activities,experience,resume_url,age,bio").eq("id", props.user.uid).maybeSingle().then(function(sdata){
-        if(pdata.data || sdata.data){
+      sb.from("students").select("*").eq("id", props.user.uid).maybeSingle().then(function(sdata){
+        var localProfile = sharedState.studentProfiles[props.user.uid] || {};
+        if(pdata.data || sdata.data || localProfile){
+          setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(pdata.data || {})); });
           setRd(function(r){return Object.assign({}, r, {
-            firstName: pdata.data?.first_name || "",
-            lastName: pdata.data?.last_name || "",
-            email: sdata.data?.email || "",
-            phone: sdata.data?.phone || "",
-            school: sdata.data?.school || "",
-            grade: sdata.data?.grade || "",
+            firstName: pdata.data?.first_name || sdata.data?.first_name || localProfile.firstName || "",
+            lastName: pdata.data?.last_name || sdata.data?.last_name || localProfile.lastName || "",
+            email: sdata.data?.email || pdata.data?.email || localProfile.email || "",
+            phone: sdata.data?.phone || localProfile.phone || "",
+            school: sdata.data?.school || localProfile.school || "",
+            grade: sdata.data?.grade || localProfile.grade || "",
             gpa: sdata.data?.gpa || "",
-            summary: sdata.data?.summary || "",
-            skills: sdata.data?.skills || [],
+            summary: sdata.data?.summary || localProfile.bio || "",
+            skills: sdata.data?.skills || localProfile.skills || [],
             activities: sdata.data?.activities || [],
             experience: sdata.data?.experience || [],
             resumeUrl: sdata.data?.resume_url || ""
           });});
           setProf(function(p){return Object.assign({}, p, {
-            firstName: pdata.data?.first_name || p.firstName,
-            lastName: pdata.data?.last_name || p.lastName,
-            email: sdata.data?.email || p.email,
-            phone: sdata.data?.phone || p.phone,
-            school: sdata.data?.school || p.school,
-            grade: sdata.data?.grade || p.grade,
-            age: sdata.data?.age || p.age,
-            bio: sdata.data?.bio || p.bio,
-            skills: sdata.data?.skills || p.skills
+            firstName: pdata.data?.first_name || sdata.data?.first_name || localProfile.firstName || p.firstName,
+            lastName: pdata.data?.last_name || sdata.data?.last_name || localProfile.lastName || p.lastName,
+            email: sdata.data?.email || pdata.data?.email || localProfile.email || p.email,
+            phone: sdata.data?.phone || localProfile.phone || p.phone,
+            school: sdata.data?.school || localProfile.school || p.school,
+            grade: sdata.data?.grade || localProfile.grade || p.grade,
+            age: sdata.data?.age || localProfile.age || p.age,
+            bio: sdata.data?.bio || localProfile.bio || p.bio,
+            skills: sdata.data?.skills || localProfile.skills || p.skills
           });});
           if(sdata.data?.resume_url){
             // Extract name from URL
@@ -1443,6 +1895,81 @@ function StudentApp(props){
       });
     });
   },[props.user, sharedTick]);
+
+  useEffect(function(){
+    if(!props.user || !premiumAccess.active) return;
+    dbLoadSavedJobMatches(props.user.uid).then(function(rows){
+      if(!Array.isArray(rows)) return;
+      var next = {};
+      rows.forEach(function(row){
+        next[row.job_id] = row;
+      });
+      setJobMatchScores(next);
+    });
+  },[props.user, premiumAccess.active]);
+
+  useEffect(function(){
+    if(!props.user || !premiumAccess.active || jobs.length===0) return;
+    var active = true;
+    dbRunJobMatches(props.user.uid, jobs.slice(0, 30).map(function(job){
+      return { id: job.id, title: job.title, description: job.desc, tags: job.tags, type: job.type, location: job.loc, company: job.co, schedule: job.sched };
+    }), prof).then(function(res){
+      if(!active || !res || res.error || !res.data) return;
+      var items = Array.isArray(res.data.matches) ? res.data.matches : [];
+      if(items.length===0) return;
+      setJobMatchScores(function(prev){
+        var next = Object.assign({}, prev);
+        items.forEach(function(item){
+          next[item.jobId || item.job_id] = item;
+        });
+        return next;
+      });
+    });
+    return function(){ active = false; };
+  },[props.user, premiumAccess.active, jobs, prof]);
+
+  useEffect(function(){
+    if(!props.user || !premiumAccess.active || nav!=="resume") return;
+    var timer = setTimeout(function(){
+      setResumeScoreLoading(true);
+      dbRunResumeReview(props.user.uid, rd, "score_only").then(function(res){
+        setResumeScoreLoading(false);
+        if(res && !res.error && res.data){
+          setResumeReview(function(prev){ return Object.assign({}, prev || {}, res.data.review || res.data); });
+        }
+      });
+    }, 900);
+    return function(){ clearTimeout(timer); };
+  },[rd, nav, props.user, premiumAccess.active]);
+
+  useEffect(function(){
+    var billingStatus = getBillingQueryStatus();
+    if(!props.user || !sb || !billingStatus) return;
+    var active = true;
+    setNav("billing");
+
+    (async function(){
+      if(billingStatus==="cancel"){
+        props.show("Stripe checkout was canceled. You can upgrade anytime from Billing.","info");
+        clearBillingQueryStatus();
+        return;
+      }
+      props.show("Checkout complete. Syncing your premium access...","info");
+      var result = await syncPremiumProfileAfterCheckout(props.user.uid, "student", function(profile){
+        if(!active) return;
+        setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(profile)); });
+      });
+      if(!active) return;
+      if(result.ok){
+        props.show("Student Premium is now active.","ok");
+      } else {
+        props.show("Stripe checkout succeeded. Subscription sync is still finishing in the background.","info");
+      }
+      clearBillingQueryStatus();
+    })();
+
+    return function(){ active = false; };
+  },[props.user]);
 
   function hasApp(id){return apps.some(function(a){return a.jobId===id;});}
 
@@ -1493,7 +2020,7 @@ function StudentApp(props){
   }
 
   async function togSave(id){
-    var key = props.user ? "launchdfw_saved_jobs_" + props.user.uid : "launchdfw_saved_jobs";
+    var key = props.user ? STORAGE_PREFIX + "_saved_jobs_" + props.user.uid : STORAGE_PREFIX + "_saved_jobs";
 
     function storeSaved(next){
       try{ localStorage.setItem(key, JSON.stringify(next)); }catch{ void 0; }
@@ -1611,12 +2138,135 @@ function StudentApp(props){
     }
   }
 
-  async function saveProfile(){
-    setProf(Object.assign({},pd));setEditP(false);
-    if(sb&&props.user){
-      await dbSaveProfile(props.user.uid, {firstName: pd.firstName, lastName: pd.lastName});
-      await dbUpdateProfile(props.user.uid,{school:pd.school,grade:pd.grade,skills:pd.skills,age:pd.age,bio:pd.bio,email:pd.email,phone:pd.phone});
+  function requirePremium(featureKey, callback) {
+    if (premiumAccess.active) {
+      if (callback) callback();
+      return true;
     }
+    setPaywallFeature(featureKey);
+    return false;
+  }
+
+  async function startUpgrade(featureKey) {
+    if (!sb) {
+      props.show("Connect Supabase and Stripe to enable subscriptions.","err");
+      return;
+    }
+    var res = await dbStartCheckout("student", featureKey || paywallFeature || "resume_review");
+    if (res.error) {
+      props.show("Unable to start checkout: " + res.error, "err");
+      return;
+    }
+    var url = res.data && (res.data.url || res.data.checkoutUrl);
+    if (url) window.location.href = url;
+  }
+
+  async function openBillingPortal() {
+    if (!sb) {
+      props.show("Connect Supabase and Stripe to manage billing.","err");
+      return;
+    }
+    var res = await dbOpenBillingPortal("student");
+    if (res.error) {
+      props.show("Unable to open billing portal: " + res.error, "err");
+      return;
+    }
+    var url = res.data && (res.data.url || res.data.portalUrl);
+    if (url) window.open(url, "_blank");
+  }
+
+  async function runFullResumeReview() {
+    if (!requirePremium("resume_review")) return;
+    setResumeScoreLoading(true);
+    var res = await dbRunResumeReview(props.user.uid, rd, "full");
+    setResumeScoreLoading(false);
+    if (res.error) {
+      props.show("Resume review failed: " + res.error, "err");
+      return;
+    }
+    setResumeReview(res.data.review || res.data || null);
+    props.show("AI resume review ready.","info");
+  }
+
+  async function startInterviewCoach(job) {
+    if (!job) return;
+    if (!requirePremium("interview_coach")) return;
+    var app = apps.find(function(entry){ return entry.jobId === job.id; });
+    var res = await dbStartInterviewCoach(props.user.uid, job.id, app ? app.id : null);
+    if (res.error) {
+      props.show("Could not start interview coach: " + res.error, "err");
+      return;
+    }
+    setInterviewSession(res.data.session || res.data || null);
+    setNav("tools");
+    setRTab("ai");
+    props.show("Interview coach session started.","info");
+  }
+
+  async function submitInterviewCoachAnswer(questionIndex, answerText, audioBase64) {
+    if (!interviewSession) return;
+    setLoading(true);
+    var question = ((interviewSession.questions || [])[questionIndex] || {}).question || "";
+    var res = await dbSubmitInterviewAnswerAi(interviewSession.id, questionIndex, question, answerText, audioBase64);
+    setLoading(false);
+    if (res.error) {
+      props.show("Interview answer review failed: " + res.error, "err");
+      return;
+    }
+    setInterviewSession(function(prev){
+      return Object.assign({}, prev || {}, res.data.session || {}, {
+        answers: res.data.answers || (prev && prev.answers) || []
+      });
+    });
+  }
+
+  async function saveProfile(){
+    if(sb&&props.user){
+      var profileRes = await dbSaveProfile(props.user.uid, {
+        firstName: pd.firstName,
+        lastName: pd.lastName,
+        email: pd.email
+      });
+      if(profileRes && profileRes.error){
+        props.show("Failed to save profile: " + profileRes.error, "err");
+        return;
+      }
+      var studentRes = await dbUpdateProfile(props.user.uid,{
+        firstName: pd.firstName,
+        lastName: pd.lastName,
+        school:pd.school,
+        grade:pd.grade,
+        skills:pd.skills,
+        age:pd.age,
+        bio:pd.bio,
+        email:pd.email,
+        phone:pd.phone
+      });
+      if(studentRes && studentRes.error){
+        props.show("Failed to save student details: " + studentRes.error, "err");
+        return;
+      }
+    }
+    setProf(Object.assign({},pd));
+    setRd(function(prev){
+      return Object.assign({}, prev, {
+        firstName: pd.firstName,
+        lastName: pd.lastName,
+        email: pd.email,
+        phone: pd.phone,
+        school: pd.school,
+        grade: pd.grade,
+        skills: pd.skills,
+        summary: pd.bio || prev.summary
+      });
+    });
+    if(props.user){
+      updateSharedState(function(state){
+        state.studentProfiles[props.user.uid] = Object.assign({}, pd);
+        return state;
+      });
+    }
+    setEditP(false);
     props.show("Profile updated! Success");
   }
 
@@ -1627,7 +2277,8 @@ function StudentApp(props){
     apps: <><FaClipboard /> Applications</>,
     ivs: <><FaCalendar /> Interviews</>,
     tools: <><FaGraduationCap /> Career Tools</>,
-    profile: <><FaUser /> My Profile</>
+    profile: <><FaUser /> My Profile</>,
+    billing: <><FaStar /> Billing</>
   };
 
   var applyCompany=applyJob?(applyJob.co||applyJob.company_name||applyJob.company||"Employer"):"";
@@ -1642,6 +2293,7 @@ function StudentApp(props){
     {id:"ivs",ic:<FaCalendar />,lb:"Interviews",b:ivApps.length||null,bc:ivApps.length?PR:null},
     {id:"tools",ic:<FaGraduationCap />,lb:"Career Tools"},
     {id:"profile",ic:<FaUser />,lb:"My Profile"},
+    {id:"billing",ic:<FaStar />,lb:"Billing",bc:premiumAccess.active?"#FBBF24":null},
   ];
 
   return(
@@ -1664,6 +2316,7 @@ function StudentApp(props){
               onMarkRead={function(){markNotificationsRead(props.user.uid,"student");setSharedTick(function(t){return t+1;});}}
               onJump={function(note){setBellOpen(false);if(note.nav) setNav(note.nav); if(note.jobId){ var job = jobs.find(function(entry){ return entry.id===note.jobId; }); if(job) setSelJob(job); }}}
             />
+            <PremiumBadge profile={Object.assign({}, prof, premiumProfile)} role="student" />
             {!resume?<span style={pill(WN)}><FaExclamationTriangle /> Upload resume to apply</span>:<span style={pill(PR)}><FaCheck /> Resume ready</span>}
           </div>
         </div>
@@ -1671,7 +2324,7 @@ function StudentApp(props){
         <div style={{flex:1,overflowY:"auto",padding:"20px 22px",display:"flex",gap:0}}>
           <div style={{flex:1,minWidth:0}}>
 
-            {nav==="jobs"&&<StudentJobsPage jobs={filteredJobs} recommendedJobs={recommendedJobs} profile={prof} allJobs={jobs} flt={flt} setFlt={setFlt} q={q} setQ={setQ} area={area} setArea={setArea} radius={radius} setRadius={setRadius} setSelJob={function(job){setSelJob(job); updateSharedState(function(state){ state.jobViews[job.id] = (state.jobViews[job.id] || 0) + 1; return state; }); }} saved={saved} togSave={togSave} hasApp={hasApp} FLTS={FLTS}/>}
+            {nav==="jobs"&&<StudentJobsPage jobs={filteredJobs} recommendedJobs={recommendedJobs} profile={prof} allJobs={jobs} flt={flt} setFlt={setFlt} q={q} setQ={setQ} area={area} setArea={setArea} radius={radius} setRadius={setRadius} setSelJob={function(job){setSelJob(job); updateSharedState(function(state){ state.jobViews[job.id] = (state.jobViews[job.id] || 0) + 1; return state; }); }} saved={saved} togSave={togSave} hasApp={hasApp} FLTS={FLTS} premiumAccess={premiumAccess} jobMatchScores={jobMatchScores} openPaywall={function(){setPaywallFeature("job_match_score");}}/>}
 
             {nav==="saved"&&(
               saved.length===0
@@ -1679,13 +2332,13 @@ function StudentApp(props){
                 :<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:11}}>{jobs.filter(function(j){return saved.includes(j.id);}).map(function(j){return <JobCard key={j.id} job={j} saved togSave={togSave} onClick={function(){setSelJob(j);}} applied={hasApp(j.id)} area={area}/>;})}</div>
             )}
 
-            {nav==="resume"&&<StudentResumePage resume={resume} setResume={setResume} rd={rd} setRd={setRd} tmpl={tmpl} setTmpl={setTmpl} tab={resTab} setTab={setResTab} show={props.show} fileRef={fileRef} nsk={nsk} setNsk={setNsk} user={props.user}/>}
+            {nav==="resume"&&<StudentResumePage resume={resume} setResume={setResume} rd={rd} setRd={setRd} tmpl={tmpl} setTmpl={setTmpl} tab={resTab} setTab={setResTab} show={props.show} fileRef={fileRef} nsk={nsk} setNsk={setNsk} user={props.user} premiumAccess={premiumAccess} resumeReview={resumeReview} resumeScoreLoading={resumeScoreLoading} onRunResumeReview={runFullResumeReview} onOpenPaywall={function(){setPaywallFeature("resume_review");}}/>}
 
             {nav==="apps"&&<AppsView apps={apps} jobs={jobs} setNav={setNav} role="student" onSendMessage={sendMessage}/>}
 
             {nav==="ivs"&&<StudentIVView apps={apps} jobs={jobs} onRespondInterview={respondInterview}/>}
 
-            {nav==="tools"&&<ToolsView tab={rTab} setTab={setRTab} oq={oqIdx} setOq={setOqIdx}/>}
+            {nav==="tools"&&<ToolsView tab={rTab} setTab={setRTab} oq={oqIdx} setOq={setOqIdx} premiumAccess={premiumAccess} apps={apps} jobs={jobs} onStartInterviewCoach={startInterviewCoach} interviewSession={interviewSession} onSubmitInterviewAnswer={submitInterviewCoachAnswer} onOpenPaywall={function(){setPaywallFeature("interview_coach");}} loading={loading}/>}
 
             {nav==="profile"&&(
               <div style={{maxWidth:720}}>
@@ -1717,11 +2370,26 @@ function StudentApp(props){
                 ):(
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:13}}>
                     <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Contact Info</h3>{[["Email",prof.email],["Phone",prof.phone],["School",prof.school],["Grade",prof.grade],["Age",prof.age]].map(function(pair){return <div key={pair[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:10,fontWeight:700}}>{pair[0]}</p><p style={{color:"#fff",fontSize:12,fontWeight:600}}>{pair[1]}</p></div>;})}</div>
-                    <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Profile Strength</h3><div style={{marginBottom:8}}><div style={{height:10,borderRadius:999,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}><div style={{width:profileCompletion.percent+"%",height:"100%",background:"linear-gradient(90deg,"+PR+","+OR+")"}}/></div><p style={{color:PR,fontSize:12,fontWeight:800,marginTop:7}}>{profileCompletion.percent}% complete</p></div><div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>{prof.skills.map(function(sk){return <span key={sk} style={pill(PR)}>{sk}</span>;})}</div>{profileCompletion.missing.length>0?<div><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:6}}>Still missing:</p><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{profileCompletion.missing.map(function(item){return <span key={item} style={pill(WN,"rgba(245,158,11,0.08)")}>{item}</span>;})}</div></div>:<p style={{color:"#6EE7B7",fontSize:12,fontWeight:700}}><FaCheckCircle /> Your profile is application-ready.</p>}</div>
+                    <div style={bx()}>
+                      <h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11}}>Profile Strength</h3>
+                      {premiumAccess.active
+                        ?<div>
+                          <div style={{marginBottom:8}}><div style={{height:10,borderRadius:999,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}><div style={{width:profileCompletion.percent+"%",height:"100%",background:"linear-gradient(90deg,"+PR+","+OR+")"}}/></div><p style={{color:PR,fontSize:12,fontWeight:800,marginTop:7}}>{profileCompletion.percent}% complete</p></div>
+                          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>{prof.skills.map(function(sk){return <span key={sk} style={pill(PR)}>{sk}</span>;})}</div>
+                          {profileCompletion.missing.length>0?<div><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:6}}>Still missing:</p><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{profileCompletion.missing.map(function(item){return <span key={item} style={pill(WN,"rgba(245,158,11,0.08)")}>{item}</span>;})}</div></div>:<p style={{color:"#6EE7B7",fontSize:12,fontWeight:700}}><FaCheckCircle /> Your profile is application-ready.</p>}
+                        </div>
+                        :<div style={{background:"rgba(251,191,36,0.06)",border:"1px solid rgba(251,191,36,0.18)",borderRadius:9,padding:"10px 12px"}}>
+                          <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:2}}>PREMIUM ONLY</p>
+                          <p style={{color:"#FDE68A",fontSize:11,lineHeight:1.6,marginBottom:10}}>Unlock Profile Strength to track completion, find missing sections, and polish your student profile faster.</p>
+                          <Btn ch="Unlock Profile Strength" sm sx={{background:"#FBBF24",color:"#111"}} onClick={function(){setPaywallFeature("profile_strength");}}/>
+                        </div>}
+                    </div>
                   </div>
                 )}
               </div>
             )}
+
+            {nav==="billing"&&<BillingPanel profile={Object.assign({}, prof, premiumProfile)} role="student" onUpgrade={function(){startUpgrade("resume_review");}} onManage={openBillingPortal}/>}
           </div>
 
           {selJob&&(
@@ -1738,6 +2406,8 @@ function StudentApp(props){
                       <h2 style={{fontFamily:FH,fontSize:15,fontWeight:800,color:"#fff",marginBottom:2}}>{selJob.title}</h2>
                       <p style={{color:MU,fontSize:12}}>{selJob.co||selJob.company_name||selJob.company||"Employer"} - {selJob.loc||selJob.location||"Location TBD"}</p>
                       <p style={{color:getVerificationBadge(selJob.verificationStatus).color,fontSize:11,marginTop:3,fontWeight:800}}>{getVerificationBadge(selJob.verificationStatus).text}</p>
+                      {selJob.isFeatured&&<p style={{color:"#FBBF24",fontSize:11,marginTop:3,fontWeight:800}}><FaStar /> Featured Employer Listing</p>}
+                      {selJob.applicationDeadline&&<p style={{color:BL,fontSize:11,marginTop:3,fontWeight:800}}><FaCalendar /> Apply by {formatDeadline(selJob.applicationDeadline)}</p>}
                       {area.la&&<p style={{color:PR,fontSize:11,marginTop:2}}><FaMapMarker /> {calcMiles(area.la,area.lo,selJob.la,selJob.lo)} miles away</p>}
                     </div>
                   </div>
@@ -1759,11 +2429,14 @@ function StudentApp(props){
                     </div>
                   )}
                   {getSkillGap(prof.skills, selJob).wanted.length>0&&<div style={{background:"rgba(255,255,255,0.03)",border:"1px solid "+BR,borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:"#fff",fontSize:11,fontWeight:800,marginBottom:6}}>Skills Gap</p><div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:7}}>{getSkillGap(prof.skills, selJob).matched.map(function(skill){return <span key={skill} style={pill(PR)}>{skill}</span>;})}{getSkillGap(prof.skills, selJob).missing.map(function(skill){return <span key={skill} style={pill(WN,"rgba(245,158,11,0.08)")}>Add {skill}</span>;})}</div><p style={{color:MU,fontSize:11}}>Adding the highlighted skills to your profile or resume can make you a stronger fit.</p></div>}
+                  {premiumAccess.active
+                    ?<div style={{background:"rgba(251,191,36,0.08)",border:"1px solid rgba(251,191,36,0.24)",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:4}}>AI Job Match Score</p><p style={{color:"#fff",fontSize:18,fontWeight:800,marginBottom:4}}>{jobMatchScores[selJob.id] && jobMatchScores[selJob.id].match_score != null ? jobMatchScores[selJob.id].match_score + "%" : "Calculating..."}</p><p style={{color:"#FDE68A",fontSize:11,lineHeight:1.6}}>{jobMatchScores[selJob.id] && jobMatchScores[selJob.id].summary ? jobMatchScores[selJob.id].summary : "We compare your skills, availability, grade, and experience against the job requirements."}</p></div>
+                    :<div style={{background:"rgba(251,191,36,0.06)",border:"1px solid rgba(251,191,36,0.18)",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:2}}>Premium Match Score</p><p style={{color:"#FDE68A",fontSize:11,lineHeight:1.6}}>Upgrade to see a personalized match percentage on every listing.</p><Btn ch="Unlock Match Score" sm sx={{marginTop:8,background:"#FBBF24",color:"#111"}} onClick={function(){setPaywallFeature("job_match_score");}}/></div>}
                   <div style={{background:"rgba(0,200,150,0.07)",border:"1px solid "+PR+"33",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:PR,fontSize:11,fontWeight:800,marginBottom:2}}><FaLock /> Safe Communication</p><p style={{color:"#6EE7B7",fontSize:11}}>All messages stay in-app. Contact info is never shared.</p></div>
                   {(selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18 && <div style={{background:"rgba(239,68,68,0.08)",border:"1px solid "+DN+"44",borderRadius:9,padding:"10px 12px",marginBottom:12}}><p style={{color:DN,fontSize:12,fontWeight:800}}>Age verification gate</p><p style={{color:"#FCA5A5",fontSize:11}}>This listing requires applicants to be 18 or older based on the age in your profile.</p></div>}
                   {!resume&&<div style={{background:"rgba(245,158,11,0.08)",border:"1px solid "+WN+"44",borderRadius:9,padding:"10px 12px",marginBottom:10}}><p style={{color:WN,fontSize:12,fontWeight:800}}>Warning: Upload resume to apply</p></div>}
                   {hasApp(selJob.id)
-                    ?<div style={{background:"rgba(0,200,150,0.1)",border:"1px solid "+PR+"44",borderRadius:11,padding:13,textAlign:"center"}}><p style={{fontSize:24,marginBottom:4}}><FaCheck size={24} /></p><p style={{color:PR,fontWeight:800,fontSize:13}}>Already Applied! Check Applications.</p></div>
+                    ?<div style={{background:"rgba(0,200,150,0.1)",border:"1px solid "+PR+"44",borderRadius:11,padding:13,textAlign:"center"}}><p style={{fontSize:24,marginBottom:4}}><FaCheck size={24} /></p><p style={{color:PR,fontWeight:800,fontSize:13,marginBottom:10}}>Already Applied! Check Applications.</p><Btn ch="Launch AI Interview Coach" v="subtle" sm onClick={function(){startInterviewCoach(selJob);}}/></div>
                     :<Btn ch={resume?(((selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18)?"18+ Required":"Apply Now"):"Upload Resume First"} lg sx={{width:"100%",justifyContent:"center",opacity:((selJob.tags || []).includes("18+") && parseInt(prof.age, 10) < 18)?0.7:1}} onClick={function(){openApply(selJob);}}/>
                   }
                 </div>
@@ -1787,26 +2460,28 @@ function StudentApp(props){
             {applyStep===2&&qs.length>0&&<div><p style={{color:MU,fontSize:13,marginBottom:11}}>Answer the employer questions.</p>{qs.map(function(q2,i){return <div key={i} style={{marginBottom:11}}><Lbl t={"Q"+(i+1)+": "+q2}/><Txa v={aAns[q2]||""} onChange={function(e){var val=e.target.value;setAAns(function(p){return Object.assign({},p,{[q2]:val});});}} ph="Your answer..." h={60}/></div>;})}</div>}
             {applyStep===steps.length-1&&<div><p style={{color:MU,fontSize:13,marginBottom:11}}>Review before submitting.</p><div style={bx({marginBottom:11})}>{[["Job",applyJob.title+" at "+applyCompany],["Available",avail.join(", ")||"Not set"],["Resume",resume?resume.name:"None"]].map(function(pair){return <div key={pair[0]} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+BR,fontSize:12}}><span style={{color:MU}}>{pair[0]}</span><span style={{color:"#fff",fontWeight:700}}>{pair[1]}</span></div>;})}</div></div>}
             <div style={{display:"flex",gap:8,marginTop:13}}>
-              {applyStep>0&&<Btn ch="Back" v="gh" onClick={function(){setApplyStep(function(s){return s-1;});}}/>}
+              {applyStep>0&&<Btn ch="Back" v="subtle" onClick={function(){setApplyStep(function(s){return s-1;});}}/>}
               <Btn ch={loading?"Submitting...":(applyStep<steps.length-1?"Continue":"Submit Application")} lg sx={{flex:1,justifyContent:"center"}} onClick={function(){applyStep<steps.length-1?setApplyStep(function(s){return s+1;}):submitApp();}}/>
             </div>
           </div>
         </Modal>
       )}
 
-      {walkthroughOpen&&<Modal onClose={function(){setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}>
+      {walkthroughOpen&&<Modal onClose={function(){setWalkthroughOpen(false);localStorage.setItem(getOnboardingKey(props.user.uid),"yes");}}>
         <div style={{padding:"16px 18px",borderBottom:"1px solid "+BR}}>
           <p style={{color:PR,fontSize:10,fontWeight:800,marginBottom:3}}>GETTING STARTED</p>
-          <h2 style={{fontFamily:FH,fontSize:16,fontWeight:800,color:"#fff"}}>Your first steps on LaunchDFW</h2>
+          <h2 style={{fontFamily:FH,fontSize:16,fontWeight:800,color:"#fff"}}>Your first steps on {APP_NAME}</h2>
         </div>
         <div style={{padding:"18px"}}>
           {[{title:"Upload or build your resume",copy:"Employers can only review you once your resume is ready.",nav:"resume"},{title:"Finish your profile",copy:"Add your age, bio, and skills so recommendations and safety checks work.",nav:"profile"},{title:"Apply and watch messages",copy:"After your first application, keep all conversation inside the app.",nav:"jobs"}].map(function(step,i){return <div key={step.title} style={{display:"flex",gap:10,marginBottom:12,opacity:i===walkStep?1:0.55}}><div style={{width:28,height:28,borderRadius:8,background:(i<=walkStep?PR:BR),display:"flex",alignItems:"center",justifyContent:"center",color:i<=walkStep?"#000":MU,fontWeight:800,fontSize:12,flexShrink:0}}>{i+1}</div><div><p style={{color:"#fff",fontWeight:800,fontSize:13,marginBottom:2}}>{step.title}</p><p style={{color:MU,fontSize:12,lineHeight:1.6}}>{step.copy}</p></div></div>;})}
           <div style={{display:"flex",gap:8,marginTop:16}}>
-            {walkStep<2?<Btn ch="Next Tip" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkStep(function(s){return s+1;});}}/>:<Btn ch="Finish Walkthrough" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}/>}
-            <Btn ch="Take Me There" v="subtle" onClick={function(){var nextNav=["resume","profile","jobs"][walkStep];setNav(nextNav);setWalkthroughOpen(false);localStorage.setItem("launchdfw_onboarding_seen_" + props.user.uid,"yes");}}/>
+            {walkStep<2?<Btn ch="Next Tip" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkStep(function(s){return s+1;});}}/>:<Btn ch="Finish Walkthrough" lg sx={{flex:1,justifyContent:"center"}} onClick={function(){setWalkthroughOpen(false);localStorage.setItem(getOnboardingKey(props.user.uid),"yes");}}/>}
+            <Btn ch="Take Me There" v="subtle" onClick={function(){var nextNav=["resume","profile","jobs"][walkStep];setNav(nextNav);setWalkthroughOpen(false);localStorage.setItem(getOnboardingKey(props.user.uid),"yes");}}/>
           </div>
         </div>
       </Modal>}
+
+      {paywallFeature&&<PaywallModal role="student" featureKey={paywallFeature} onClose={function(){setPaywallFeature(null);}} onUpgrade={function(){startUpgrade(paywallFeature);}} />}
     </div>
   );
 }
@@ -1825,10 +2500,15 @@ function StudentJobsPage(props){
       {props.recommendedJobs && props.recommendedJobs.length>0&&<div style={bx({marginBottom:14,borderColor:PR+"33"})}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
           <div><p style={{color:PR,fontSize:11,fontWeight:800,letterSpacing:1}}>RECOMMENDED FOR YOU</p><p style={{color:MU,fontSize:12}}>Based on your skills, age, location, and application history.</p></div>
-          <span style={pill(PR)}>{props.profile.skills.length} skills on profile</span>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {props.premiumAccess.active
+              ?<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}>AI Match Scores On</span>
+              :<span style={pill(MU,"rgba(255,255,255,0.05)")}>Upgrade for AI Match Scores</span>}
+            <span style={pill(PR)}>{props.profile.skills.length} skills on profile</span>
+          </div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))",gap:10}}>
-          {props.recommendedJobs.map(function(job){return <JobCard key={"rec-"+job.id} job={job} area={props.area} onClick={function(){props.setSelJob(job);}} saved={props.saved.includes(job.id)} togSave={props.togSave} applied={props.hasApp(job.id)} />;})}
+          {props.recommendedJobs.map(function(job){return <JobCard key={"rec-"+job.id} job={job} area={props.area} onClick={function(){props.setSelJob(job);}} saved={props.saved.includes(job.id)} togSave={props.togSave} applied={props.hasApp(job.id)} premiumAccess={props.premiumAccess} matchScore={props.jobMatchScores[job.id]} onOpenPaywall={props.openPaywall} />;})}
         </div>
       </div>}
       <div style={bx({marginBottom:14,borderColor:PR+"33"})}>
@@ -1848,7 +2528,7 @@ function StudentJobsPage(props){
       </div>
       <p style={{color:MU,fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:10}}>{props.jobs.length} JOBS FOUND{props.area.la?" WITHIN "+props.radius+"MI":""}</p>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:11}}>
-        {props.jobs.map(function(j){return <JobCard key={j.id} job={j} saved={props.saved.includes(j.id)} togSave={props.togSave} onClick={function(){props.setSelJob(j);}} applied={props.hasApp(j.id)} area={props.area}/>;}) }
+        {props.jobs.map(function(j){return <JobCard key={j.id} job={j} saved={props.saved.includes(j.id)} togSave={props.togSave} onClick={function(){props.setSelJob(j);}} applied={props.hasApp(j.id)} area={props.area} premiumAccess={props.premiumAccess} matchScore={props.jobMatchScores[j.id]} onOpenPaywall={props.openPaywall}/>;}) }
       </div>
       {props.jobs.length===0&&<p style={{color:MU,textAlign:"center",padding:"40px 0"}}>{props.allJobs.length===0?"No live jobs yet. Businesses need to post listings before students can apply.":"No jobs match. Try adjusting filters or radius."}</p>}
     </div>
@@ -1859,7 +2539,7 @@ function JobCard(props){
   var job=props.job,area=props.area;
   var d=area&&area.la?calcMiles(area.la,area.lo,job.la,job.lo):null;
   return(
-    <div className="jc" onClick={props.onClick} style={bx({padding:14,position:"relative"})}>
+    <div className="jc" onClick={props.onClick} style={bx({padding:14,position:"relative",border:job.isFeatured?"1px solid rgba(251,191,36,0.28)":"1px solid "+BR,background:job.isFeatured?"linear-gradient(180deg,rgba(251,191,36,0.06),rgba(20,28,46,1))":CD})}>
       <div style={{display:"flex",gap:12,alignItems:"flex-start",marginBottom:10}}>
         <div style={{width:46,height:46,borderRadius:12,background:job.clr+"22",border:"1px solid "+job.clr+"44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>{job.logo}</div>
         <div style={{flex:1,minWidth:0}}>
@@ -1872,8 +2552,15 @@ function JobCard(props){
         <span style={pill(job.clr)}>{job.type}</span>
         <span style={pill("#10B981")}>{job.pay}</span>
         <span style={pill(getVerificationBadge(job.verificationStatus).color, getVerificationBadge(job.verificationStatus).bg)}>{getVerificationBadge(job.verificationStatus).text}</span>
+        {job.isFeatured&&<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}><FaStar /> Featured</span>}
         {props.applied&&<span style={Object.assign({},pill(PR),{fontSize:10})}><FaCheck /> Applied</span>}
         {job.posted==="Today"&&<span style={Object.assign({},pill(OR),{fontSize:10})}><FaStar /> New</span>}
+        {job.applicationDeadline&&<span style={pill(BL,"rgba(59,130,246,0.08)")}><FaCalendar /> Apply by {formatDeadline(job.applicationDeadline)}</span>}
+      </div>
+      <div style={{marginBottom:8}}>
+        {props.premiumAccess && props.premiumAccess.active
+          ?<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}><FaChartLine style={{marginRight:4}} /> {props.matchScore && props.matchScore.match_score != null ? props.matchScore.match_score + "% match" : "AI match loading"}</span>
+          :<span className="ni" onClick={function(e){e.stopPropagation(); if(props.onOpenPaywall) props.onOpenPaywall();}} style={pill(MU,"rgba(255,255,255,0.04)")}><FaLock style={{marginRight:4}} /> Premium match score</span>}
       </div>
       <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{color:MU,fontSize:11}}><FaMapMarker /> {job.loc}</span>
@@ -1960,11 +2647,86 @@ function StudentIVView(props){
 function ToolsView(props){
   var IQ=[{q:"Tell me about yourself.",a:"Under 60 seconds: your school, a strength, and why you want this role."},{q:"Why do you want this job?",a:"Be specific - reference something real about the company or role."},{q:"What are your strengths?",a:"Pick 2 with a small example each. Show, do not just tell."},{q:"What is a weakness?",a:"Name a real one, then show you are actively working on it."},{q:"How do you handle a difficult customer?",a:"Use LAST: Listen, Acknowledge, Solve, Thank."},{q:"Do you have questions for us?",a:"Always yes! Ask: What does success look like in the first month?"}];
   var W=[{t:"Punctuality",b:"Arrive 5-10 min early. Text if late. One no-call no-show can end a job."},{t:"Dress Code",b:"When in doubt, dress one level above what is required."},{t:"Phone Policy",b:"Keep your phone in your pocket during your shift."},{t:"Communication",b:"Ask questions - it is a strength. Never say that is not my job."},{t:"Teamwork",b:"Help teammates without being asked. This gets you noticed and promoted."},{t:"Paychecks and Taxes",b:"Taxes are withheld from your check. Keep stubs and file taxes every spring."}];
+  var [drafts,setDrafts]=useState({});
+  var [audioFiles,setAudioFiles]=useState({});
+  var appliedJobs = props.apps.map(function(app){
+    var job = props.jobs.find(function(entry){ return entry.id === app.jobId; });
+    return job ? Object.assign({}, job, { applicationId: app.id, applicationStatus: app.status }) : null;
+  }).filter(Boolean);
   return(
     <div>
       <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
-        {[{id:"iv",l:<><FaMicrophone /> Interview Prep</>},{id:"w101",l:<><FaBriefcase /> Work 101</>},{id:"stories",l:<><FaTrophy /> Success Stories</>}].map(function(t){return <Btn key={t.id} ch={t.l} v={props.tab===t.id?"pr":"gh"} onClick={function(){props.setTab(t.id);}}/>;}) }
+        {[{id:"iv",l:<><FaMicrophone /> Interview Prep</>},{id:"ai",l:<><FaStar /> AI Coach</>},{id:"w101",l:<><FaBriefcase /> Work 101</>},{id:"stories",l:<><FaTrophy /> Success Stories</>}].map(function(t){return <Btn key={t.id} ch={t.l} v={props.tab===t.id?"pr":"subtle"} onClick={function(){props.setTab(t.id);}}/>;}) }
       </div>
+      {props.tab==="ai"&&<div style={{maxWidth:760}}>
+        {!props.premiumAccess.active
+          ?<div style={bx({border:"1px solid rgba(251,191,36,0.25)"})}>
+            <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:5}}>PREMIUM ONLY</p>
+            <h3 style={{fontFamily:FH,fontSize:17,fontWeight:800,color:"#fff",marginBottom:6}}>AI Interview Coach</h3>
+            <p style={{color:MU,fontSize:12,lineHeight:1.7,marginBottom:12}}>Choose one of your applications, answer tailored interview questions, and get a readiness score with written feedback after each response.</p>
+            <Btn ch="Unlock AI Interview Coach" lg sx={{background:"#FBBF24",color:"#111"}} onClick={props.onOpenPaywall}/>
+          </div>
+          :<div>
+            {!props.interviewSession&&<div style={bx({marginBottom:14})}>
+              <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:5}}>START A SESSION</p>
+              <h3 style={{fontFamily:FH,fontSize:17,fontWeight:800,color:"#fff",marginBottom:6}}>Pick a job you applied to</h3>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:11}}>
+                {appliedJobs.length===0&&<p style={{color:MU,fontSize:12}}>Apply to a job first, then come back here for tailored interview practice.</p>}
+                {appliedJobs.map(function(job){
+                  return <div key={job.id} style={bx({padding:14})}>
+                    <p style={{color:"#fff",fontWeight:800,fontSize:13,marginBottom:3}}>{job.title}</p>
+                    <p style={{color:MU,fontSize:12,marginBottom:10}}>{job.co}</p>
+                    <Btn ch="Start AI Session" sm onClick={function(){props.onStartInterviewCoach(job);}}/>
+                  </div>;
+                })}
+              </div>
+            </div>}
+            {props.interviewSession&&<div style={bx()}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:14}}>
+                <div>
+                  <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:4}}>LIVE SESSION</p>
+                  <h3 style={{fontFamily:FH,fontSize:17,fontWeight:800,color:"#fff"}}>AI Interview Coach</h3>
+                </div>
+                {props.interviewSession.readinessScore != null && <span style={pill("#FBBF24","rgba(251,191,36,0.12)")}>Readiness {props.interviewSession.readinessScore}%</span>}
+              </div>
+              {(props.interviewSession.questions || []).map(function(item, idx){
+                var answer = drafts[idx] || "";
+                var reviewed = (props.interviewSession.answers || []).find(function(entry){ return Number(entry.questionIndex) === Number(idx); });
+                return <div key={idx} style={bx({background:BG,marginBottom:10,padding:14})}>
+                  <p style={{color:PR,fontSize:11,fontWeight:800,marginBottom:5}}>QUESTION {idx+1}</p>
+                  <p style={{color:"#fff",fontSize:13,fontWeight:700,marginBottom:10}}>{item.question || item}</p>
+                  <Txa v={answer} onChange={function(e){var val=e.target.value;setDrafts(function(prev){ return Object.assign({}, prev, {[idx]:val}); });}} h={74} ph="Type your answer here..." />
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:9,marginBottom:9}}>
+                    <input type="file" accept="audio/*" onChange={function(e){var file=e.target.files && e.target.files[0]; if(file) setAudioFiles(function(prev){ return Object.assign({}, prev, {[idx]:file}); });}} />
+                    <Btn ch={props.loading?"Scoring...":"Score This Answer"} sm onClick={function(){
+                      var audioFile = audioFiles[idx];
+                      if(audioFile){
+                        var reader = new FileReader();
+                        reader.onload = function(){
+                          var raw = String(reader.result || "");
+                          var base64 = raw.indexOf(",") >= 0 ? raw.split(",")[1] : raw;
+                          props.onSubmitInterviewAnswer(idx, answer, base64);
+                        };
+                        reader.readAsDataURL(audioFile);
+                        return;
+                      }
+                      props.onSubmitInterviewAnswer(idx, answer, null);
+                    }}/>
+                  </div>
+                  {reviewed&&<div style={{background:"rgba(251,191,36,0.08)",border:"1px solid rgba(251,191,36,0.2)",borderRadius:10,padding:"10px 12px"}}>
+                    <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:4}}>AI FEEDBACK {reviewed.score != null ? "- " + reviewed.score + "/100" : ""}</p>
+                    <p style={{color:"#FDE68A",fontSize:12,lineHeight:1.6,marginBottom:6}}>{reviewed.feedback || "Feedback will appear here after scoring."}</p>
+                    {reviewed.improvedAnswer&&<p style={{color:"#fff",fontSize:12,lineHeight:1.6}}><strong>Stronger version:</strong> {reviewed.improvedAnswer}</p>}
+                  </div>}
+                </div>;
+              })}
+              {props.interviewSession.summary&&<div style={{marginTop:10,background:"rgba(0,200,150,0.07)",border:"1px solid "+PR+"33",borderRadius:12,padding:"12px 14px"}}>
+                <p style={{color:PR,fontWeight:800,fontSize:12,marginBottom:4}}>Session Summary</p>
+                <p style={{color:"#D1FAE5",fontSize:12,lineHeight:1.7}}>{props.interviewSession.summary}</p>
+              </div>}
+            </div>}
+          </div>}
+      </div>}
       {props.tab==="iv"&&<div style={{maxWidth:680}}>{IQ.map(function(item,i){return <div key={i} className="jc" onClick={function(){props.setOq(props.oq===i?null:i);}} style={bx({marginBottom:9,border:"1px solid "+(props.oq===i?PR+"55":BR)})}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{display:"flex",gap:10,alignItems:"center"}}><span style={{width:20,height:20,borderRadius:6,background:PR+"22",border:"1px solid "+PR+"44",display:"flex",alignItems:"center",justifyContent:"center",color:PR,fontSize:9,fontWeight:800,flexShrink:0}}>Q{i+1}</span><p style={{color:"#fff",fontWeight:700,fontSize:13}}>{item.q}</p></div><span style={{color:MU,fontSize:16}}>{props.oq===i?"v":">"}</span></div>{props.oq===i&&<div style={{marginTop:10,paddingTop:10,borderTop:"1px solid "+BR}}><p style={{color:"#D1FAE5",fontSize:12,lineHeight:1.7,background:PR+"0A",borderRadius:8,padding:10}}><strong style={{color:PR}}>Strategy: </strong>{item.a}</p></div>}</div>;})} </div>}
       {props.tab==="w101"&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>{W.map(function(item,i){return <div key={i} style={bx()}><p style={{color:"#fff",fontWeight:800,fontSize:13,fontFamily:FH,marginBottom:6}}>{item.t}</p><p style={{color:MU,fontSize:12,lineHeight:1.7}}>{item.b}</p></div>;})} </div>}
       {props.tab==="stories"&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(290px,1fr))",gap:12}}>{[{n:"Maya R.",age:16,j:"Barista at Houndstooth",c:"#F59E0B",q:"Zero experience and so nervous. Interview prep helped me get the job first try!",t:"Practice answers out loud the night before."},{n:"Carlos M.",age:19,j:"IT Intern at AT&T",c:"#3B82F6",q:"I thought internships were only for people with connections. This proved me wrong.",t:"School projects count as real experience."},{n:"Priya S.",age:17,j:"Youth Coach at YMCA",c:"#10B981",q:"They trained me, and now I lead a soccer team every Saturday. Best thing I have done.",t:"Apply to jobs that offer training."}].map(function(s,i){return <div key={i} style={bx({border:"1px solid "+s.c+"33"})}><div style={{display:"flex",gap:10,alignItems:"center",marginBottom:11}}><div style={{width:38,height:38,borderRadius:11,background:s.c+"22",border:"1px solid "+s.c+"44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}><FaGraduationCap /></div><div><p style={{color:"#fff",fontWeight:800,fontSize:13}}>{s.n}</p><p style={{color:MU,fontSize:11}}>Age {s.age} - {s.j}</p></div></div><p style={{color:"#D1D5DB",fontSize:12,lineHeight:1.7,fontStyle:"italic",marginBottom:9}}>"{s.q}"</p><div style={{background:s.c+"11",border:"1px solid "+s.c+"33",borderRadius:8,padding:"8px 11px"}}><p style={{color:s.c,fontSize:11,fontWeight:800}}>Tip: {s.t}</p></div></div>;})} </div>}
@@ -2002,6 +2764,39 @@ function StudentResumePage(props){
   }
   return(
     <div>
+      <div style={bx({marginBottom:16,borderColor:props.premiumAccess.active?"rgba(251,191,36,0.25)":BR})}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}}>
+          <div>
+            <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1}}>AI RESUME REVIEWER</p>
+            <p style={{color:MU,fontSize:12,marginTop:3}}>Score your resume, rewrite weaker bullets, and spot missing sections before you apply.</p>
+          </div>
+          {props.premiumAccess.active
+            ?<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}>{props.resumeScoreLoading ? "Scoring..." : ((props.resumeReview && props.resumeReview.score != null) ? props.resumeReview.score + "/100" : "Ready to Review")}</span>
+            :<span style={pill(MU,"rgba(255,255,255,0.05)")}>Premium only</span>}
+        </div>
+        {props.premiumAccess.active
+          ?<div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+              <Btn ch={props.resumeScoreLoading?"Reviewing...":"Run Full AI Review"} sm sx={{background:"#FBBF24",color:"#111"}} onClick={props.onRunResumeReview}/>
+              {props.resumeReview && props.resumeReview.summary && <Btn ch="Jump to Builder" v="subtle" sm onClick={function(){props.setTab("builder");}}/>}
+            </div>
+            {props.resumeReview&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div style={bx({background:BG,padding:14})}>
+                <p style={{color:"#fff",fontWeight:800,fontSize:12,marginBottom:6}}>AI Summary</p>
+                <p style={{color:MU,fontSize:12,lineHeight:1.7}}>{props.resumeReview.summary || "Live score updates while you edit. Run a full review when you want detailed rewrites."}</p>
+              </div>
+              <div style={bx({background:BG,padding:14})}>
+                <p style={{color:"#fff",fontWeight:800,fontSize:12,marginBottom:6}}>Improvement Focus</p>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {(props.resumeReview.missing_sections || props.resumeReview.missingSections || []).length > 0
+                    ?(props.resumeReview.missing_sections || props.resumeReview.missingSections || []).map(function(item){ return <span key={item} style={pill(WN,"rgba(245,158,11,0.08)")}>{item}</span>; })
+                    :<span style={pill(PR,"rgba(0,200,150,0.08)")}>No major gaps flagged</span>}
+                </div>
+              </div>
+            </div>}
+          </div>
+          :<Btn ch="Unlock AI Resume Review" sm sx={{background:"#FBBF24",color:"#111"}} onClick={props.onOpenPaywall}/>}
+      </div>
       <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
         {[{id:"upload",l:<><FaUpload /> Upload</>},{id:"builder",l:<><FaWrench /> Resume Builder</>},{id:"templates",l:<><FaPalette /> Templates</>},{id:"example",l:<><FaFileAlt /> Example</>}].map(function(t){return <Btn key={t.id} ch={t.l} v={props.tab===t.id?"pr":"subtle"} onClick={function(){props.setTab(t.id);}}/>;}) }
       </div>
@@ -2054,9 +2849,20 @@ function StudentResumePage(props){
             <Btn ch="Download PDF" v="subtle" lg sx={{flex:1,justifyContent:"center"}} onClick={downloadResumePdf}/>
             <Btn ch="Save and Use This Resume" lg sx={{flex:1,justifyContent:"center"}} onClick={async function(){
             if(sb&&props.user){
-              await dbSaveProfile(props.user.uid, props.rd);
-              await dbSaveResumeData(props.user.uid, props.rd);
-              props.show("Resume data saved!");
+              var profileRes = await dbSaveProfile(props.user.uid, {
+                firstName: props.rd.firstName,
+                lastName: props.rd.lastName,
+                email: props.rd.email
+              });
+              if(profileRes && profileRes.error){
+                props.show("Failed to save resume profile: " + profileRes.error,"err");
+                return;
+              }
+              var resumeRes = await dbSaveResumeData(props.user.uid, props.rd);
+              if(resumeRes && resumeRes.error){
+                props.show("Failed to save resume data: " + resumeRes.error,"err");
+                return;
+              }
             }
             props.setResume(function(prev){return {name:(prev&&prev.name)||props.rd.firstName+"_"+props.rd.lastName+"_Resume.pdf",size:(prev&&prev.size)||"Saved",url:(prev&&prev.url)||props.rd.resumeUrl||""};});
             props.show("Resume saved! You can now apply.");
@@ -2091,8 +2897,14 @@ function BizApp(props){
   var [selectedApps,setSelectedApps]=useState([]);
   var [bellOpen,setBellOpen]=useState(false);
   var [sharedTick,setSharedTick]=useState(0);
+  var [premiumProfile,setPremiumProfile]=useState(createPremiumFields(props.user||{}));
+  var [paywallFeature,setPaywallFeature]=useState(null);
+  var [applicantRankings,setApplicantRankings]=useState({});
+  var [analyticsRows,setAnalyticsRows]=useState([]);
+  var [jobWriterNotes,setJobWriterNotes]=useState("");
   var sharedState = readSharedState();
   var notifications = (sharedState.notifications || []).filter(function(note){ return note.role==="business" && note.userId === (props.user?.uid || "demo-biz"); });
+  var premiumAccess = getPremiumAccess(Object.assign({}, biz, premiumProfile), "business");
 
   useEffect(function(){
     if(props.initialNav) setNav(props.initialNav);
@@ -2107,8 +2919,16 @@ function BizApp(props){
       var nextBiz = createBusinessProfile(props.user.businessProfile);
       setBiz(nextBiz);
       setBd(Object.assign({}, nextBiz));
+      setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(props.user.businessProfile)); });
     }
   },[props.user]);
+
+  useEffect(function(){
+    if(!props.user || !sb) return;
+    dbLoadPremiumProfile(props.user.uid).then(function(data){
+      if(data) setPremiumProfile(function(prev){ return Object.assign({}, prev, data); });
+    });
+  },[props.user, sharedTick]);
 
   // Load real data from Supabase when connected
   useEffect(function(){
@@ -2117,24 +2937,34 @@ function BizApp(props){
       if(Array.isArray(data)) setMyJobs(applySharedJobs(data.map(normalizeJob), false).filter(function(job){ return String(job.employerOwnerId || job.employer_id || "") === String(props.user.uid); }));
     });
     dbLoadEmployerProfile(props.user.uid).then(function(data){
-      if(!data) return;
+      var localProfile = sharedState.employerProfiles[props.user.uid] || {};
+      if(!data && !localProfile) return;
       var mapped = createBusinessProfile({
-        company: data.employer.company_name || props.user.name,
-        firstName: data.profile.first_name || splitName(data.employer.contact_name || "").firstName,
-        lastName: data.profile.last_name || splitName(data.employer.contact_name || "").lastName,
-        email: data.employer.email || data.profile.email || "",
-        phone: data.employer.phone || "",
-        address: data.employer.address || "",
-        website: data.employer.website || "",
-        industry: data.employer.industry || "",
-        companySize: data.employer.company_size || "",
-        about: data.employer.about || "",
-        verificationStatus: data.employer.verification_status || "pending",
-        emailDomainMatch: data.employer.email_domain_match,
-        verificationSignal: data.employer.verification_signal || ""
+        company: data && data.employer ? (data.employer.company_name || localProfile.co || props.user.name) : (localProfile.co || props.user.name),
+        firstName: data && data.profile ? (data.profile.first_name || splitName(localProfile.nm || "").firstName || "") : (splitName(localProfile.nm || "").firstName || ""),
+        lastName: data && data.profile ? (data.profile.last_name || splitName(localProfile.nm || "").lastName || "") : (splitName(localProfile.nm || "").lastName || ""),
+        email: data && data.profile ? (data.profile.email || (data.employer && data.employer.email) || localProfile.email || "") : (localProfile.email || ""),
+        phone: data && data.employer ? (data.employer.phone || localProfile.phone || "") : (localProfile.phone || ""),
+        address: data && data.employer ? (data.employer.address || localProfile.addr || "") : (localProfile.addr || ""),
+        website: data && data.employer ? (data.employer.website || localProfile.web || "") : (localProfile.web || ""),
+        industry: data && data.employer ? (data.employer.industry || localProfile.ind || "") : (localProfile.ind || ""),
+        companySize: data && data.employer ? (data.employer.company_size || localProfile.size || "") : (localProfile.size || ""),
+        about: data && data.employer ? (data.employer.about || localProfile.about || "") : (localProfile.about || ""),
+        verificationStatus: data && data.employer ? (data.employer.verification_status || localProfile.verificationStatus || "pending") : (localProfile.verificationStatus || "pending"),
+        emailDomainMatch: data && data.employer ? (data.employer.email_domain_match != null ? data.employer.email_domain_match : localProfile.emailDomainMatch) : localProfile.emailDomainMatch,
+        verificationSignal: data && data.employer ? (data.employer.verification_signal || localProfile.verificationSignal || "") : (localProfile.verificationSignal || ""),
+        subscriptionRole: data && data.profile ? (data.profile.subscription_role || "") : "",
+        premiumStatus: data && data.profile ? (data.profile.premium_status || "free") : "free",
+        premiumPlanKey: data && data.profile ? (data.profile.premium_plan_key || "") : "",
+        premiumExpiresAt: data && data.profile ? (data.profile.premium_expires_at || "") : "",
+        trialEndsAt: data && data.profile ? (data.profile.trial_ends_at || "") : "",
+        stripeCustomerId: data && data.profile ? (data.profile.stripe_customer_id || "") : "",
+        stripeSubscriptionId: data && data.profile ? (data.profile.stripe_subscription_id || "") : "",
+        cancelAtPeriodEnd: data && data.profile ? (data.profile.cancel_at_period_end || false) : false
       });
       setBiz(mapped);
       setBd(Object.assign({}, mapped));
+      setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(mapped)); });
     });
     dbLoadApplicants(props.user.uid).then(function(data){
       if(Array.isArray(data)){
@@ -2189,6 +3019,31 @@ function BizApp(props){
   },[props.user, sharedTick]);
 
   useEffect(function(){
+    if(!props.user || myJobs.length===0) return;
+    dbLoadApplicantRankings(myJobs.map(function(job){ return job.id; })).then(function(rows){
+      if(!Array.isArray(rows)) return;
+      var next = {};
+      rows.forEach(function(row){
+        next[row.application_id] = row;
+      });
+      setApplicantRankings(next);
+    });
+  },[props.user, myJobs, sharedTick]);
+
+  useEffect(function(){
+    if(!props.user || !premiumAccess.active) return;
+    dbLoadAnalytics(props.user.uid).then(function(rows){
+      if(Array.isArray(rows)) setAnalyticsRows(rows);
+    });
+  },[props.user, premiumAccess.active, sharedTick]);
+
+  useEffect(function(){
+    setMyJobs(function(prev){
+      return prev.map(function(job){ return Object.assign({}, job, { isFeatured: premiumAccess.active }); });
+    });
+  },[premiumAccess.active]);
+
+  useEffect(function(){
     if(sb || !props.user) return;
     var sharedJobs = applySharedJobs([]).filter(function(job){
       return job.employerOwnerId === props.user.uid || (biz.co && job.co === biz.co);
@@ -2219,6 +3074,125 @@ function BizApp(props){
     });
     setApplicants(mapped);
   },[props.user, biz.co, sharedTick]);
+
+  useEffect(function(){
+    var billingStatus = getBillingQueryStatus();
+    if(!props.user || !sb || !billingStatus) return;
+    var active = true;
+    setNav("billing");
+
+    (async function(){
+      if(billingStatus==="cancel"){
+        props.show("Stripe checkout was canceled. You can upgrade anytime from Billing.","info");
+        clearBillingQueryStatus();
+        return;
+      }
+      props.show("Checkout complete. Syncing your premium access...","info");
+      var result = await syncPremiumProfileAfterCheckout(props.user.uid, "business", function(profile){
+        if(!active) return;
+        setPremiumProfile(function(prev){ return Object.assign({}, prev, createPremiumFields(profile)); });
+      });
+      if(!active) return;
+      if(result.ok){
+        props.show("Employer Premium is now active.","ok");
+      } else {
+        props.show("Stripe checkout succeeded. Subscription sync is still finishing in the background.","info");
+      }
+      clearBillingQueryStatus();
+    })();
+
+    return function(){ active = false; };
+  },[props.user]);
+
+  function requirePremium(featureKey, callback) {
+    if (premiumAccess.active) {
+      if (callback) callback();
+      return true;
+    }
+    setPaywallFeature(featureKey);
+    return false;
+  }
+
+  async function startUpgrade(featureKey) {
+    if (!sb) {
+      props.show("Connect Supabase and Stripe to enable subscriptions.","err");
+      return;
+    }
+    var res = await dbStartCheckout("business", featureKey || paywallFeature || "applicant_ranking");
+    if (res.error) {
+      props.show("Unable to start checkout: " + res.error, "err");
+      return;
+    }
+    var url = res.data && (res.data.url || res.data.checkoutUrl);
+    if (url) window.location.href = url;
+  }
+
+  async function openBillingPortal() {
+    if (!sb) {
+      props.show("Connect Supabase and Stripe to manage billing.","err");
+      return;
+    }
+    var res = await dbOpenBillingPortal("business");
+    if (res.error) {
+      props.show("Unable to open billing portal: " + res.error, "err");
+      return;
+    }
+    var url = res.data && (res.data.url || res.data.portalUrl);
+    if (url) window.open(url, "_blank");
+  }
+
+  async function refreshRankings(jobId) {
+    if (!requirePremium("applicant_ranking")) return;
+    var res = await dbRefreshApplicantRankings(props.user.uid, jobId);
+    if (res.error) {
+      props.show("AI applicant ranking failed: " + res.error, "err");
+      return;
+    }
+    var items = Array.isArray(res.data.rankings) ? res.data.rankings : [];
+    setApplicantRankings(function(prev){
+      var next = Object.assign({}, prev);
+      items.forEach(function(item){
+        next[item.applicationId || item.application_id] = item;
+      });
+      return next;
+    });
+    props.show("Applicant rankings refreshed.","info");
+  }
+
+  async function runJobWriter() {
+    if (!requirePremium("job_writer")) return;
+    var res = await dbGenerateJobDraft(props.user.uid, jobWriterNotes, nj);
+    if (res.error) {
+      props.show("AI job writer failed: " + res.error, "err");
+      return;
+    }
+    var draft = res.data.draft || res.data || {};
+    setNj(function(prev){
+      return Object.assign({}, prev, {
+        title: draft.title || prev.title,
+        desc: draft.description || draft.desc || prev.desc,
+        pay: draft.pay || draft.suggestedPay || prev.pay,
+        type: draft.type || prev.type,
+        tags: Array.isArray(draft.tags) && draft.tags.length ? draft.tags : prev.tags,
+        qs: Array.isArray(draft.questions) && draft.questions.length ? draft.questions : prev.qs
+      });
+    });
+    props.show("AI job draft generated.","info");
+  }
+
+  async function runScreeningQuestionSuggestions() {
+    if (!requirePremium("screening_questions")) return;
+    var res = await dbSuggestAiQuestions(props.user.uid, nj);
+    if (res.error) {
+      props.show("AI screening question suggestions failed: " + res.error, "err");
+      return;
+    }
+    var questions = res.data.questions || [];
+    if (Array.isArray(questions) && questions.length > 0) {
+      setNj(function(prev){ return Object.assign({}, prev, { qs: questions }); });
+      props.show("AI screening questions added.","info");
+    }
+  }
 
   async function updStatus(id,st){
     if(sb){var res=await dbUpdateAppStatus(id,st);if(res.error){props.show("Error: "+res.error,"err");return;}}
@@ -2333,14 +3307,16 @@ function BizApp(props){
   }
 
   async function addJob(){
-    if(!nj.title||!nj.pay||!nj.desc){props.show("Title, pay, and description required","err");return;}
+    if(!nj.title||!nj.pay||!nj.desc||!nj.applicationDeadline){props.show("Title, pay, description, and deadline required","err");return;}
     var selectedArea = resolveAreaByLabel(nj.areaLabel) || resolveAreaByLabel(inferAreaLabelFromJob({ loc:nj.loc }));
     var coords = selectedArea && selectedArea.la != null ? { la:selectedArea.la, lo:selectedArea.lo } : getJobCoordinates({ loc:nj.loc, areaLabel:nj.areaLabel });
     var cleanedQuestions=nj.qs.filter(function(q){return q.trim();});
     var cleanedTags=(nj.tags || []).filter(Boolean);
     var resolvedAreaLabel = (selectedArea && selectedArea.l) || inferAreaLabelFromJob({ loc:nj.loc }) || nj.areaLabel;
-    var dbJobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:cleanedQuestions,spots:parseInt(nj.spots,10)||1,is_active:true,area_label:resolvedAreaLabel};
-    var jobViewData={loc:nj.loc,sched:nj.sched,train:nj.train,desc:nj.desc,qs:cleanedQuestions,tags:cleanedTags,la:coords.la,lo:coords.lo,areaLabel:resolvedAreaLabel,spots:parseInt(nj.spots,10)||1};
+    var deadlineIso = toDeadlineIso(nj.applicationDeadline);
+    if(!deadlineIso){props.show("Enter a valid application deadline","err");return;}
+    var dbJobData={title:nj.title,type:nj.type,pay:nj.pay,location:nj.loc,schedule:nj.sched,training:nj.train,description:nj.desc,questions:cleanedQuestions,spots:parseInt(nj.spots,10)||1,is_active:true,area_label:resolvedAreaLabel,application_deadline:deadlineIso};
+    var jobViewData={loc:nj.loc,sched:nj.sched,train:nj.train,desc:nj.desc,qs:cleanedQuestions,tags:cleanedTags,la:coords.la,lo:coords.lo,areaLabel:resolvedAreaLabel,spots:parseInt(nj.spots,10)||1,applicationDeadline:deadlineIso,deadline:deadlineIso};
     if(editJobId){
       if(sb&&props.user){var updRes=await dbUpdateJob(props.user.uid,editJobId,dbJobData);if(updRes.error){props.show("Error: "+updRes.error,"err");return;}}
       setMyJobs(function(p){return p.map(function(job){return String(job.id)===String(editJobId)?normalizeJob(Object.assign({},job,dbJobData,jobViewData,{co:biz.co})):job;});});
@@ -2359,12 +3335,12 @@ function BizApp(props){
       createdRow = res.data || null;
     }
     var newJobId = createdRow && createdRow.id ? createdRow.id : Date.now();
-    var storedJob=Object.assign({}, createdRow || dbJobData, jobViewData, {id:newJobId,co:biz.co,iconKey:"star",clr:"#F59E0B",posted:"Today",employerOwnerId:props.user.uid,verificationStatus:biz.verificationStatus || "pending",deadline:getDefaultDeadline(newJobId)});
+    var storedJob=Object.assign({}, createdRow || dbJobData, jobViewData, {id:newJobId,co:biz.co,iconKey:"star",clr:"#F59E0B",posted:"Today",employerOwnerId:props.user.uid,verificationStatus:biz.verificationStatus || "pending",applicationDeadline:deadlineIso,deadline:deadlineIso});
     var localJob=normalizeJob(storedJob);
     setMyJobs(function(p){return p.concat([localJob]);});
     updateSharedState(function(state){
       if(sb && createdRow && createdRow.id){
-        state.jobOverrides[createdRow.id] = Object.assign({}, state.jobOverrides[createdRow.id] || {}, jobViewData, { co:biz.co, employerOwnerId:props.user.uid, verificationStatus:biz.verificationStatus || "pending", iconKey:"star", clr:"#F59E0B", posted:"Today", deadline:getDefaultDeadline(newJobId) });
+        state.jobOverrides[createdRow.id] = Object.assign({}, state.jobOverrides[createdRow.id] || {}, jobViewData, { co:biz.co, employerOwnerId:props.user.uid, verificationStatus:biz.verificationStatus || "pending", iconKey:"star", clr:"#F59E0B", posted:"Today", applicationDeadline:deadlineIso, deadline:deadlineIso });
       } else {
         state.customJobs = (state.customJobs || []).filter(function(job){ return String(job.id) !== String(storedJob.id); }).concat([storedJob]);
       }
@@ -2392,7 +3368,12 @@ function BizApp(props){
 
   var pend=applicants.filter(function(a){return a.status==="pending";}).length;
   var scheduledIVs=applicants.filter(function(a){return a.iv;});
-  var disp=fj==="all"?applicants:applicants.filter(function(a){return a.jobId===parseInt(fj)||a.job_id===fj;});
+  var disp=(fj==="all"?applicants:applicants.filter(function(a){return a.jobId===parseInt(fj)||a.job_id===fj;})).slice().sort(function(a,b){
+    if(!premiumAccess.active) return 0;
+    var aScore = applicantRankings[a.id] && applicantRankings[a.id].match_score != null ? applicantRankings[a.id].match_score : -1;
+    var bScore = applicantRankings[b.id] && applicantRankings[b.id].match_score != null ? applicantRankings[b.id].match_score : -1;
+    return bScore - aScore;
+  });
 
   var navItems=[
     {id:"overview",ic:<FaChartLine />,lb:"Overview"},
@@ -2400,6 +3381,8 @@ function BizApp(props){
     {id:"applicants",ic:<FaUsers />,lb:"Applicants",b:pend||null},
     {id:"interviews",ic:<FaCalendar />,lb:"Interviews",b:scheduledIVs.length||null,bc:PR},
     {id:"profile",ic:<FaBuilding />,lb:"Business Profile"},
+    {id:"analytics",ic:<FaChartLine />,lb:"Analytics",bc:premiumAccess.active?"#FBBF24":null},
+    {id:"billing",ic:<FaStar />,lb:"Billing",bc:premiumAccess.active?"#FBBF24":null},
   ];
 
   return(
@@ -2415,6 +3398,7 @@ function BizApp(props){
           </div>
           <div style={{display:"flex",gap:9,alignItems:"center"}}>
             <HeaderBell open={bellOpen} onToggle={function(){setBellOpen(!bellOpen);}} onClose={function(){setBellOpen(false);}} notifications={notifications} onMarkRead={function(){markNotificationsRead(props.user.uid || "demo-biz","business");setSharedTick(function(t){return t+1;});}} onJump={function(note){setBellOpen(false);if(note.nav) setNav(note.nav);}}/>
+            <PremiumBadge profile={Object.assign({}, biz, premiumProfile)} role="business" />
             <Btn ch="+ Post New Job" v="or" sm sx={{background:OR,color:"#000"}} onClick={openCreateJob}/>
             <span style={pill(OR)}><FaBriefcase style={{marginRight:4}}/> Employer</span>
           </div>
@@ -2423,16 +3407,17 @@ function BizApp(props){
         <div style={{flex:1,overflowY:"auto",padding:"20px 22px"}}>
 
           {nav==="overview"&&<div>
-            <p style={{color:MU,fontSize:13,marginBottom:16}}>Your hiring activity on LaunchDFW.</p>
+            <p style={{color:MU,fontSize:13,marginBottom:16}}>Your hiring activity on {APP_NAME}.</p>
             <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:11,marginBottom:20}}>
               {[{n:myJobs.length,l:<><FaClipboard /> Listings</>,c:OR},{n:applicants.length,l:<><FaUsers /> Applicants</>,c:BL},{n:pend,l:<><FaHourglassHalf /> Pending</>,c:WN},{n:applicants.filter(function(a){return a.status==="accepted";}).length,l:<><FaCheck /> Accepted</>,c:"#10B981"}].map(function(s){return <div key={s.l} style={bx({textAlign:"center"})}><p style={{fontFamily:FH,fontSize:22,fontWeight:800,color:s.c}}>{s.n}</p><p style={{color:MU,fontSize:11,marginTop:2,display:"flex",alignItems:"center",justifyContent:"center",gap:4}}>{s.l}</p></div>;})}
             </div>
+            {!premiumAccess.active&&<div style={bx({marginBottom:18,border:"1px solid rgba(251,191,36,0.22)"})}><p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:5}}>PREMIUM EMPLOYER</p><p style={{color:"#fff",fontSize:14,fontWeight:700,marginBottom:6}}>Unlock AI rankings, AI job writing, featured placement, and analytics.</p><Btn ch={"Start " + PREMIUM_TRIAL_DAYS + "-Day Free Trial"} sm sx={{background:"#FBBF24",color:"#111"}} onClick={function(){startUpgrade("applicant_ranking");}}/></div>}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
               <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11,display:"flex",alignItems:"center",gap:6}}><FaUsers /> Recent Applicants</h3>
                 {applicants.slice(0,5).map(function(a){var j=myJobs.find(function(x){return x.id===a.jobId||x.id===a.job_id;});return <div key={a.id} className="ni" onClick={function(){setSelA(a);setNav("applicants");}} style={{display:"flex",gap:9,alignItems:"center",padding:"7px 0",borderBottom:"1px solid "+BR,cursor:"pointer"}}><div style={{width:30,height:30,borderRadius:8,background:OR+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0}}><FaUser /></div><div style={{flex:1}}><p style={{color:"#fff",fontWeight:700,fontSize:12}}>{a.name}</p><p style={{color:MU,fontSize:11}}>{j?j.title:""}</p></div><span style={pill(a.status==="pending"?WN:a.status==="accepted"?"#10B981":DN)}>{a.status}</span></div>;})}
               </div>
               <div style={bx()}><h3 style={{fontFamily:FH,fontSize:13,fontWeight:700,color:"#fff",marginBottom:11,display:"flex",alignItems:"center",gap:6}}><FaClipboard /> Your Listings</h3>
-                {myJobs.map(function(j){var cnt=applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;}).length;return <div key={j.id} style={{display:"flex",gap:9,alignItems:"center",padding:"7px 0",borderBottom:"1px solid "+BR}}><div style={{width:30,height:30,borderRadius:8,background:j.clr+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>{j.logo}</div><div style={{flex:1}}><p style={{color:"#fff",fontWeight:700,fontSize:12}}>{j.title}</p><p style={{color:MU,fontSize:11}}>{cnt} applicant{cnt!==1?"s":""}</p></div><span style={pill(OR)}>{j.type}</span></div>;})}
+                {myJobs.map(function(j){var cnt=applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;}).length;return <div key={j.id} style={{display:"flex",gap:9,alignItems:"center",padding:"7px 0",borderBottom:"1px solid "+BR}}><div style={{width:30,height:30,borderRadius:8,background:j.clr+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>{j.logo}</div><div style={{flex:1}}><p style={{color:"#fff",fontWeight:700,fontSize:12}}>{j.title}</p><p style={{color:MU,fontSize:11}}>{cnt} applicant{cnt!==1?"s":""}{j.applicationDeadline?" · Closes " + formatDeadline(j.applicationDeadline):""}</p></div>{j.isFeatured&&<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}>Featured</span>}<span style={pill(OR)}>{j.type}</span></div>;})}
               </div>
             </div>
           </div>}
@@ -2447,7 +3432,7 @@ function BizApp(props){
                 <div style={{display:"flex",gap:12}}>
                   <div style={{width:46,height:46,borderRadius:11,background:j.clr+"22",border:"1px solid "+j.clr+"44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{j.logo}</div>
                   <div style={{flex:1}}>
-                    <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:6}}><div><h3 style={{fontFamily:FH,fontSize:14,fontWeight:800,color:"#fff",marginBottom:1}}>{j.title}</h3><p style={{color:MU,fontSize:12}}>{j.loc||j.location} - {j.sched||j.schedule}</p></div><div style={{display:"flex",gap:6}}><span style={pill(j.clr)}>{j.type}</span><span style={pill("#10B981")}>{j.pay}</span></div></div>
+                    <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:6}}><div><h3 style={{fontFamily:FH,fontSize:14,fontWeight:800,color:"#fff",marginBottom:1}}>{j.title}</h3><p style={{color:MU,fontSize:12}}>{j.loc||j.location} - {j.sched||j.schedule}</p>{j.applicationDeadline&&<p style={{color:BL,fontSize:11,marginTop:4}}>Apply by {formatDeadline(j.applicationDeadline)}</p>}</div><div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{j.isFeatured&&<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}><FaStar /> Featured</span>}<span style={pill(j.clr)}>{j.type}</span><span style={pill("#10B981")}>{j.pay}</span></div></div>
                     {j.qs&&j.qs.length>0&&<div style={{marginBottom:9}}><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:5}}>Custom Questions: {j.qs.length}</p><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{j.qs.map(function(q2,i){return <span key={i} style={pill(BL,"rgba(59,130,246,0.08)")} title={q2}>Q{i+1}: {q2.length>36?q2.slice(0,36)+"...":q2}</span>;})}</div></div>}
                     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
                       {[{l:"Applied",n:a2.length,c:BL},{l:"Pending",n:a2.filter(function(a){return a.status==="pending";}).length,c:WN},{l:"Open",n:j.spots||1,c:OR}].map(function(s){return <div key={s.l} style={{background:BG,borderRadius:9,padding:"8px 11px",border:"1px solid "+BR}}><p style={{color:s.c,fontFamily:FH,fontSize:18,fontWeight:800}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.l}</p></div>;})}
@@ -2455,7 +3440,7 @@ function BizApp(props){
                     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginTop:8}}>
                       {[{l:"Views",n:views,c:PR},{l:"Applied",n:a2.length,c:BL},{l:"Conversion",n:conversion+"%",c:"#10B981"}].map(function(s){return <div key={s.l} style={{background:"rgba(255,255,255,0.03)",borderRadius:9,padding:"8px 11px",border:"1px solid "+BR}}><p style={{color:s.c,fontFamily:FH,fontSize:18,fontWeight:800}}>{s.n}</p><p style={{color:MU,fontSize:11}}>{s.l}</p></div>;})}
                     </div>
-                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11,flexWrap:"wrap"}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/><Btn ch="Edit Post" v="subtle" sm onClick={function(){openEditJob(j);}}/><Btn ch="Delete Post" v="dn" sm onClick={function(){deleteJob(j);}}/></div>
+                    <div style={{display:"flex",gap:8,marginTop:11,borderTop:"1px solid "+BR,paddingTop:11,flexWrap:"wrap"}}><Btn ch={"View Applicants ("+a2.length+")"} sm onClick={function(){setFj(String(j.id));setNav("applicants");}}/><Btn ch="Refresh AI Rankings" v="subtle" sm onClick={function(){refreshRankings(j.id);}}/><Btn ch="Edit Post" v="subtle" sm onClick={function(){openEditJob(j);}}/><Btn ch="Delete Post" v="dn" sm onClick={function(){deleteJob(j);}}/></div>
                   </div>
                 </div>
               </div>;
@@ -2469,6 +3454,7 @@ function BizApp(props){
                 {myJobs.map(function(j){return <option key={j.id} value={String(j.id)}>{j.title} ({applicants.filter(function(a){return a.jobId===j.id||a.job_id===j.id;}).length})</option>;})}
               </select>
               <div style={{display:"flex",gap:6}}>{[{s:"pending",c:WN},{s:"accepted",c:"#10B981"},{s:"declined",c:DN}].map(function(x){return <span key={x.s} style={pill(x.c)}>{x.s} ({applicants.filter(function(a){return a.status===x.s;}).length})</span>;})}</div>
+              <Btn ch="Refresh AI Rankings" v="subtle" sm onClick={function(){ if(fj!=="all") refreshRankings(parseInt(fj,10)); else setPaywallFeature("applicant_ranking"); }}/>
               {selectedApps.length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap"}}><Btn ch={"Accept ("+selectedApps.length+")"} sm onClick={function(){bulkUpdate("accepted");}}/><Btn ch="Decline" v="dn" sm onClick={function(){bulkUpdate("declined");}}/><Btn ch="Move to Pending" v="subtle" sm onClick={function(){bulkUpdate("pending");}}/></div>}
             </div>
             {disp.length===0&&<p style={{color:MU,textAlign:"center",padding:"30px 0"}}>No applicants yet.</p>}
@@ -2476,6 +3462,7 @@ function BizApp(props){
               var j=myJobs.find(function(x){return x.id===a.jobId||x.id===a.job_id;});
               var isSel=selA&&selA.id===a.id;
               var scol=a.status==="pending"?WN:a.status==="accepted"?"#10B981":DN;
+              var ranking = applicantRankings[a.id];
               return <div key={a.id} className="jc" onClick={function(){setSelA(isSel?null:a);}} style={bx({border:"1px solid "+(isSel?OR+"66":BR)})}>
                 <div style={{display:"flex",gap:11}}>
                   <input type="checkbox" checked={selectedApps.includes(a.id)} onChange={function(e){e.stopPropagation();setSelectedApps(function(prev){return prev.includes(a.id)?prev.filter(function(id){return id!==a.id;}):prev.concat([a.id]);});}} style={{marginTop:12}}/>
@@ -2483,13 +3470,15 @@ function BizApp(props){
                   <div style={{flex:1}}>
                     <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
                       <div><p style={{color:"#fff",fontWeight:800,fontSize:13,fontFamily:FH}}>{a.name}</p><p style={{color:MU,fontSize:12}}>{a.school} - {a.grade} - Age {a.age}</p></div>
-                      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{starred:!a.starred});}} style={{cursor:"pointer",color:a.starred?WN:MU,fontSize:14}}><FaStar /></span><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{flagged:!a.flagged});}} style={{cursor:"pointer",color:a.flagged?DN:MU,fontSize:14}}><FaFlag /></span>{a.iv&&<span style={pill(PR)}><FaCalendar style={{marginRight:4}}/> Interview Set</span>}<span style={pill(scol)}>{a.status}</span></div>
+                      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{starred:!a.starred});}} style={{cursor:"pointer",color:a.starred?WN:MU,fontSize:14}}><FaStar /></span><span onClick={function(e){e.stopPropagation();updateApplicantMeta(a.id,{flagged:!a.flagged});}} style={{cursor:"pointer",color:a.flagged?DN:MU,fontSize:14}}><FaFlag /></span>{ranking&&<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}>AI {ranking.match_score}%</span>}{a.iv&&<span style={pill(PR)}><FaCalendar style={{marginRight:4}}/> Interview Set</span>}<span style={pill(scol)}>{a.status}</span></div>
                     </div>
                     <div style={{display:"flex",gap:10,marginTop:5,flexWrap:"wrap"}}><span style={{color:MU,fontSize:11}}>{j?j.title:""}</span><span style={{color:MU,fontSize:11}}>Applied: {a.applied}</span><span style={{color:MU,fontSize:11}}>{a.email}</span></div>
+                    {ranking&&<p style={{color:"#FDE68A",fontSize:11,marginTop:6,lineHeight:1.6}}>{ranking.summary_reason}</p>}
                     {a.note&&<p style={{color:"#ccc",fontSize:12,marginTop:7,padding:"7px 10px",background:BG,borderRadius:7}}>"{a.note}"</p>}
                   </div>
                 </div>
                 {isSel&&<div style={{marginTop:11,paddingTop:11,borderTop:"1px solid "+BR}}>
+                  {ranking&&<div style={bx({background:"rgba(251,191,36,0.08)",marginBottom:10})}><p style={{color:"#FBBF24",fontSize:11,fontWeight:800,marginBottom:6}}>AI Ranking Summary</p><p style={{color:"#FDE68A",fontSize:12,marginBottom:6}}>{ranking.summary_reason}</p><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{(ranking.strengths || []).map(function(item){ return <span key={item} style={pill(PR)}>{item}</span>; })}{(ranking.concerns || []).map(function(item){ return <span key={item} style={pill(WN,"rgba(245,158,11,0.08)")}>{item}</span>; })}</div></div>}
                   {a.ans&&Object.keys(a.ans).length>0&&<div style={bx({background:BG,marginBottom:10})}><p style={{color:BL,fontSize:11,fontWeight:800,marginBottom:8,display:"flex",alignItems:"center",gap:6}}><FaStickyNote /> Applicant Answers</p>{Object.entries(a.ans).map(function(entry){return <div key={entry[0]} style={{marginBottom:8}}><p style={{color:MU,fontSize:11,fontWeight:700,marginBottom:2}}>{entry[0]}</p><p style={{color:"#D1D5DB",fontSize:12,lineHeight:1.6}}>{entry[1]}</p></div>;})}</div>}
                   <div style={bx({background:BG,marginBottom:10})}><p style={{color:OR,fontSize:11,fontWeight:800,marginBottom:6}}>Private Employer Notes</p><Txa v={a.employerNotes||""} onClick={function(e){e.stopPropagation();}} onChange={function(e){var val=e.target.value;updateApplicantMeta(a.id,{employerNotes:val});}} h={64} ph="Internal notes only your team can see..." /></div>
                   {a.iv&&a.iv.status==="requested_new_time"&&<div style={{background:"rgba(245,158,11,0.08)",border:"1px solid "+WN+"44",borderRadius:9,padding:"10px 12px",marginBottom:10}}><p style={{color:WN,fontSize:12,fontWeight:800}}>Student requested a different time</p><p style={{color:"#FDE68A",fontSize:11,marginTop:4}}>{a.iv.responseNote || "No note provided."}</p></div>}
@@ -2523,6 +3512,14 @@ function BizApp(props){
               <div style={bx()}><Lbl t="INDUSTRY"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.ind}</p><Lbl t="SIZE"/><p style={{color:"#fff",fontSize:13,fontWeight:600,marginBottom:9}}>{biz.size}</p><Lbl t="ABOUT"/><p style={{color:MU,fontSize:12,lineHeight:1.7,marginBottom:12}}>{biz.about}</p><div style={{background:getVerificationBadge(biz.verificationStatus).bg,border:"1px solid "+getVerificationBadge(biz.verificationStatus).color+"33",borderRadius:9,padding:"9px 11px",marginBottom:10}}><p style={{color:getVerificationBadge(biz.verificationStatus).color,fontSize:11,fontWeight:800,marginBottom:2}}>{getVerificationBadge(biz.verificationStatus).text}</p><p style={{color:"#FED7AA",fontSize:11}}>{biz.verificationStatus==="approved"?"Students will see your green verified badge on your profile and job listings.":"Your business stays pending until reviewed manually in the Supabase dashboard."}</p></div>{biz.verificationStatus!=="approved"&&<div style={{background:(biz.emailDomainMatch?PR:WN)+"11",border:"1px solid "+(biz.emailDomainMatch?PR:WN)+"33",borderRadius:9,padding:"9px 11px"}}><p style={{color:biz.emailDomainMatch?PR:WN,fontSize:11,fontWeight:800,marginBottom:2}}>{biz.emailDomainMatch?"Email Matches Website Domain":"Manual Review Required"}</p><p style={{color:MU,fontSize:11}}>{biz.emailDomainMatch?"Your sign-up email appears to match your business website domain, which helps reviewers approve faster.":"Use a business email that matches your website domain to improve verification confidence."}</p></div>}</div>
             </div>}
           </div>}
+
+          {nav==="analytics"&&(
+            premiumAccess.active
+              ?<EmployerAnalyticsView rows={analyticsRows} jobs={myJobs}/>
+              :<div style={bx({maxWidth:760,border:"1px solid rgba(251,191,36,0.22)"})}><p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:5}}>ADVANCED ANALYTICS</p><p style={{color:"#fff",fontSize:14,fontWeight:700,marginBottom:6}}>See views, conversion, average match score, school sources, weekday patterns, and similar-role benchmarks.</p><Btn ch="Unlock Analytics" sm sx={{background:"#FBBF24",color:"#111"}} onClick={function(){setPaywallFeature("analytics");}}/></div>
+          )}
+
+          {nav==="billing"&&<BillingPanel profile={Object.assign({}, biz, premiumProfile)} role="business" onUpgrade={function(){startUpgrade("applicant_ranking");}} onManage={openBillingPortal}/>}
         </div>
       </div>
 
@@ -2568,6 +3565,20 @@ function BizApp(props){
           <Btn ch="X" v="subtle" sm onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/>
         </div>
         <div style={{padding:"14px 18px 18px",maxHeight:"70vh",overflowY:"auto"}}>
+          <div style={bx({marginBottom:12,border:"1px solid rgba(251,191,36,0.2)"})}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:8}}>
+              <div>
+                <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1}}>AI JOB WRITER</p>
+                <p style={{color:MU,fontSize:12}}>Paste rough notes and let AI draft the listing, pay guidance, tags, and screening questions.</p>
+              </div>
+              {!premiumAccess.active&&<span style={pill(MU,"rgba(255,255,255,0.05)")}>Premium only</span>}
+            </div>
+            <Txa v={jobWriterNotes} onChange={function(e){setJobWriterNotes(e.target.value);}} h={72} ph="Example: Weekend front desk role at our tutoring center. Friendly, punctual, helps parents check in students and answer phones." />
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:9}}>
+              <Btn ch="Generate with AI" sm sx={{background:"#FBBF24",color:"#111"}} onClick={runJobWriter}/>
+              <Btn ch="Suggest 5 Questions" v="subtle" sm onClick={runScreeningQuestionSuggestions}/>
+            </div>
+          </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:9}}>
             <div><Lbl t="JOB TITLE (required)"/><Inp v={nj.title} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{title:val});});}} ph="e.g. Barista Trainee"/></div>
             <div><Lbl t="JOB TYPE"/><select value={nj.type} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{type:val});});}} style={Object.assign({},INP,{cursor:"pointer"})}>{["Part-Time","Internship","Seasonal","Full-Time"].map(function(t){return <option key={t}>{t}</option>;})}</select></div>
@@ -2577,6 +3588,7 @@ function BizApp(props){
             <div><Lbl t="SCHEDULE"/><Inp v={nj.sched} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{sched:val});});}} ph="e.g. Weekends"/></div>
             <div><Lbl t="TRAINING PROVIDED"/><Inp v={nj.train} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{train:val});});}} ph="e.g. Full training"/></div>
             <div><Lbl t="OPEN SPOTS"/><Inp v={String(nj.spots||1)} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{spots:val});});}} ph="1" tp="number"/></div>
+            <div><Lbl t="APPLICATION DEADLINE (required)"/><Inp v={nj.applicationDeadline||""} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{applicationDeadline:val});});}} tp="date"/></div>
           </div>
           <div style={{marginBottom:12}}><Lbl t="DESCRIPTION (required)"/><Txa v={nj.desc} onChange={function(e){var val=e.target.value;setNj(function(p){return Object.assign({},p,{desc:val});});}} ph="Describe the role..." h={72}/></div>
           <div style={{marginBottom:14}}>
@@ -2595,6 +3607,74 @@ function BizApp(props){
           <div style={{display:"flex",gap:8}}><Btn ch={editJobId?"Save Job Changes":"Post Job Listing"} lg sx={{flex:1,justifyContent:"center",background:OR,color:"#000"}} onClick={addJob}/><Btn ch="Cancel" v="subtle" onClick={function(){setShowAdd(false);setEditJobId(null);setNj(createEmptyJobDraft());}}/></div>
         </div>
       </Modal>}
+
+      {paywallFeature&&<PaywallModal role="business" featureKey={paywallFeature} onClose={function(){setPaywallFeature(null);}} onUpgrade={function(){startUpgrade(paywallFeature);}} />}
+    </div>
+  );
+}
+
+function EmployerAnalyticsView(props) {
+  var rows = Array.isArray(props.rows) ? props.rows : [];
+  var latestByJob = {};
+  rows.forEach(function(row){
+    if(!latestByJob[row.job_id]) latestByJob[row.job_id] = row;
+  });
+  var cards = props.jobs.map(function(job){
+    return {
+      job: job,
+      data: latestByJob[job.id] || {
+        total_views: 0,
+        total_applications: 0,
+        conversion_rate: 0,
+        average_applicant_match_score: 0,
+        applicant_schools: {},
+        applications_by_weekday: {},
+        similar_role_average_views: 0,
+        similar_role_average_applications: 0
+      }
+    };
+  });
+  return (
+    <div style={{maxWidth:980}}>
+      <div style={bx({marginBottom:16})}>
+        <p style={{color:"#FBBF24",fontSize:11,fontWeight:800,letterSpacing:1,marginBottom:4}}>ADVANCED ANALYTICS</p>
+        <p style={{color:MU,fontSize:12}}>Live premium performance snapshots for each listing. Analytics update as students view and apply.</p>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:14}}>
+        {cards.map(function(item){
+          var data = item.data;
+          var schoolItems = Object.entries(data.applicant_schools || {}).slice(0,5).map(function(entry){ return { label: entry[0], value: entry[1] }; });
+          var weekdayItems = Object.entries(data.applications_by_weekday || {}).map(function(entry){ return { label: entry[0], value: entry[1] }; });
+          return <div key={item.job.id} style={bx()}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:12}}>
+              <div>
+                <h3 style={{fontFamily:FH,fontSize:16,fontWeight:800,color:"#fff"}}>{item.job.title}</h3>
+                <p style={{color:MU,fontSize:12}}>{item.job.loc}</p>
+              </div>
+              {item.job.isFeatured&&<span style={pill("#FBBF24","rgba(251,191,36,0.12)")}><FaStar /> Featured Listing</span>}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:10,marginBottom:12}}>
+              {[["Views",data.total_views],["Applications",data.total_applications],["Conversion",String(data.conversion_rate || 0) + "%"],["Avg Match",String(Math.round(data.average_applicant_match_score || 0)) + "%"]].map(function(pair){
+                return <div key={pair[0]} style={bx({background:BG,padding:14})}><p style={{color:MU,fontSize:10,fontWeight:700,marginBottom:3}}>{pair[0].toUpperCase()}</p><p style={{color:"#fff",fontSize:16,fontWeight:800}}>{pair[1]}</p></div>;
+              })}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <div style={bx({background:BG,padding:14})}>
+                <p style={{color:"#fff",fontWeight:800,fontSize:12,marginBottom:8}}>Top Applicant Schools</p>
+                <SimpleBarChart items={schoolItems.length ? schoolItems : [{ label:"No data yet", value:0 }]} color={OR}/>
+              </div>
+              <div style={bx({background:BG,padding:14})}>
+                <p style={{color:"#fff",fontWeight:800,fontSize:12,marginBottom:8}}>Applications by Weekday</p>
+                <SimpleBarChart items={weekdayItems.length ? weekdayItems : [{ label:"No data yet", value:0 }]} color={PR}/>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:12}}>
+              <div style={bx({background:BG,padding:14})}><p style={{color:MU,fontSize:10,fontWeight:700,marginBottom:3}}>SIMILAR ROLE AVG VIEWS</p><p style={{color:"#fff",fontSize:16,fontWeight:800}}>{Math.round(data.similar_role_average_views || 0)}</p></div>
+              <div style={bx({background:BG,padding:14})}><p style={{color:MU,fontSize:10,fontWeight:700,marginBottom:3}}>SIMILAR ROLE AVG APPLICATIONS</p><p style={{color:"#fff",fontSize:16,fontWeight:800}}>{Math.round(data.similar_role_average_applications || 0)}</p></div>
+            </div>
+          </div>;
+        })}
+      </div>
     </div>
   );
 }
